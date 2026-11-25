@@ -1,0 +1,23 @@
+mcp.yourdomain.com {
+    log_skip /<SECRET_PATH_ETALIB>/mcp
+    log_skip /<SECRET_PATH_GITHUB>/mcp
+
+    handle /<SECRET_PATH_ETALIB>/mcp {
+        rewrite * /mcp
+        reverse_proxy 127.0.0.1:8101 {
+            flush_interval -1
+        }
+    }
+    handle /<SECRET_PATH_GITHUB>/mcp {
+        rewrite * /mcp
+        reverse_proxy 127.0.0.1:8102 {
+            flush_interval -1
+        }
+    }
+    handle {
+        respond 404
+    }
+}
+
+# 务必同步在 note.etalib.space 的 Caddy reverse_proxy 块中添加：
+# header_up -X-MCP-Internal-Token
