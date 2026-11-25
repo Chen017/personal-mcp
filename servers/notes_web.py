@@ -41,6 +41,7 @@ Primary MCP server for the user's personal notes (SiYuan Notes on {notes_domain}
    Use this server whenever the user says "check my notes", "my notes", "search my notes", "course notes", "lectures", or shares a {notes_domain} link. This is the user's real notes repository (distinct from Google Keep or Google Drive). Supports listing notebooks (`notes_list_shares`), searching notes (`notes_search_notes`), reading clean Markdown with LaTeX (`notes_read_document`), browsing course trees (`notes_get_share_tree`), and inspecting document outlines (`notes_get_document_outline`).
 2. Webpage, Blog & Remote PDF Reader ({blog_domain}, {notes_domain}, and any external website / 抓取网页、博客文章、解析远程PDF):
    Directly fetch, read, map, crawl, extract structured JSON, parse remote PDFs, and interact with webpages — including {blog_domain}, JS-rendered sites, documentation sites, and external PDFs.
+   - `web_search` runs lightweight Firecrawl v2 snippet search (titles/URLs/snippets only, no auto-scraping, clamped to <= 10 results = 2 credits, repeat queries cached locally) for second-opinion verification, time-filtered lookups, and finding primary sources before selectively calling `web_scrape`.
    - `web_scrape` and `web_scrape_pdf` cache full Markdown locally in memory (TTL ~30 min) and support `offset` pagination + `find_keyword` jumping at zero extra Firecrawl credits.
    - Multi-page tools (`web_crawl`, `web_batch_scrape`, `web_extract_structured`) use soft confirmation thresholds (`confirm_large=True` to proceed on large batches).
 
@@ -54,6 +55,7 @@ PINNED_TOOLS = [
     "notes_search_notes",
     "notes_read_document",
     "notes_list_shares",
+    "web_search",
     "web_scrape",
     "web_map",
 ]
@@ -150,13 +152,17 @@ def _get_cached_web(kind: str, url: str, variant: str) -> dict[str, Any] | None:
     return payload
 
 
-def _set_cached_web(kind: str, url: str, variant: str, markdown: str, metadata: dict[str, Any]) -> None:
+def _set_cached_payload(kind: str, url: str, variant: str, payload: dict[str, Any]) -> None:
     key = (kind, url, variant)
-    _web_cache[key] = (time.monotonic(), {"markdown": markdown, "metadata": metadata})
+    _web_cache[key] = (time.monotonic(), payload)
     _web_cache.move_to_end(key)
     max_entries = _web_cache_max_entries()
     while len(_web_cache) > max_entries:
         _web_cache.popitem(last=False)
+
+
+def _set_cached_web(kind: str, url: str, variant: str, markdown: str, metadata: dict[str, Any]) -> None:
+    _set_cached_payload(kind, url, variant, {"markdown": markdown, "metadata": metadata})
 
 
 def _cache_crawl_pages(items: list[dict[str, Any]]) -> None:
@@ -459,7 +465,97 @@ async def notes_get_document_outline(share: str, doc_id: str = "") -> dict:
     return await _call_siyuan_notes("get_document_outline", args)
 
 
-# ==================== 2. Firecrawl v2 Tools (11 total: 2 pinned + 9 hidden) ====================
+# ==================== 2. Firecrawl v2 Tools (12 total: 3 pinned + 9 hidden) ====================
+
+
+def _normalize_search_results(raw_data: Any) -> list[dict[str, str]]:
+    """Normalize list- or dict-shaped Firecrawl v2 /search responses into compact snippets."""
+    groups: list[tuple[str, list[Any]]] = []
+    if isinstance(raw_data, list):
+        groups.append(("web", raw_data))
+    elif isinstance(raw_data, dict):
+        for source_key, items in raw_data.items():
+            if isinstance(items, list):
+                groups.append((str(source_key), items))
+
+    results: list[dict[str, str]] = []
+    for source_name, items in groups:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            item_url = str(item.get("url") or meta.get("sourceURL") or meta.get("url") or "").strip()
+            item_title = str(item.get("title") or meta.get("title") or "").strip()
+            if not item_url and not item_title:
+                continue
+
+            raw_desc = item.get("description") or item.get("snippet") or ""
+            if not raw_desc and isinstance(item.get("highlights"), list):
+                raw_desc = " ... ".join(str(h).strip() for h in item["highlights"] if str(h).strip())
+            desc = truncate_text(str(raw_desc).strip(), max_chars=400) if str(raw_desc).strip() else ""
+
+            entry: dict[str, str] = {
+                "title": item_title,
+                "url": item_url,
+                "description": desc,
+                "source": source_name,
+            }
+            item_date = item.get("date") or item.get("publishedDate") or meta.get("publishedTime") or ""
+            if isinstance(item_date, str) and item_date.strip():
+                entry["date"] = item_date.strip()
+            results.append(entry)
+    return results
+
+
+@mcp.tool(annotations={"title": "Web Snippet Search (Firecrawl v2, 2 Credits)", **READ_ONLY_ANNOTATIONS})
+async def web_search(
+    query: str,
+    limit: int = 8,
+    tbs: Literal["", "qdr:h", "qdr:d", "qdr:w", "qdr:m", "qdr:y"] = "",
+    country: str = "",
+    refresh: bool = False,
+) -> dict:
+    """Run a lightweight Firecrawl v2 web search returning titles, URLs, and short snippets only (no auto-scraping; clamped to <= 10 results = 2 credits/call; repeat queries cached locally). Use for second-opinion verification, time-filtered queries, or finding primary sources when built-in search is inconclusive, empty, blocked, or before concluding something does not exist. Follow up with web_scrape on only the 1-2 most relevant URLs (轻量网页二次核查搜索，仅返回标题链接摘要，固定 2 credits/次).
+    Keywords: firecrawl web search snippet verify second opinion recent tbs query.
+    """
+    clean_query = query.strip()
+    if not clean_query:
+        return {"isError": True, "error": "query must be a non-empty string."}
+
+    clamped_limit = max(1, min(limit, 10))
+    clean_country = country.strip().upper()
+    valid_country = clean_country if len(clean_country) == 2 and clean_country.isalpha() else ""
+    variant = f"limit={clamped_limit}|tbs={tbs}|country={valid_country}"
+
+    if not refresh:
+        cached_entry = _get_cached_web("search", clean_query.lower(), variant)
+        if cached_entry is not None:
+            return {**cached_entry, "cached": True}
+
+    payload: dict[str, Any] = {"query": clean_query, "limit": clamped_limit}
+    if tbs:
+        payload["tbs"] = tbs
+    if valid_country:
+        payload["country"] = valid_country
+
+    res = await _fc_request("POST", "/search", json=payload)
+    if res.get("isError"):
+        return res
+
+    results = _normalize_search_results(res.get("data"))
+    response_body: dict[str, Any] = {
+        "query": clean_query,
+        "limit": clamped_limit,
+        "cached": False,
+        "count": len(results),
+        "credits_note": (
+            "Snippet search only (no auto-scrape, <=10 results = 2 credits). "
+            "Call web_scrape on only the 1-2 most relevant URLs if full page text is needed."
+        ),
+        "results": results,
+    }
+    _set_cached_payload("search", clean_query.lower(), variant, dict(response_body))
+    return response_body
 
 
 @mcp.tool(annotations={"title": "Scrape Webpage (Firecrawl v2 + Cache Pagination)", **READ_ONLY_ANNOTATIONS})

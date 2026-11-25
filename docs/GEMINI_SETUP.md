@@ -48,15 +48,19 @@ curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_NOTES}/mcp" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notes_list_shares","arguments":{}}}' | head -c 400; echo ""
 
-# 2) Verify Firecrawl v2 web_scrape
+# 2) Verify Firecrawl v2 web_scrape & web_search
 curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_NOTES}/mcp" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_scrape","arguments":{"url":"https://example.com","max_chars":500}}}' | head -c 400; echo ""
 
+curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_NOTES}/mcp" \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"example domain","limit":3}}}' | head -c 400; echo ""
+
 # 3) Verify GitHub Personal
 curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_GITHUB}/mcp" \
   -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gh_list_repos","arguments":{"limit":3}}}' | head -c 400; echo ""
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"gh_list_repos","arguments":{"limit":3}}}' | head -c 400; echo ""
 ```
 
 ---
@@ -73,7 +77,7 @@ curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_GITHUB}/mcp" \
    - **MCP Server URL**: `https://mcp.example.com/<SECRET_PATH_GITHUB>/mcp`
    - **Authentication**: `No authentication`
 4. Open `https://gemini.google.com/devmode`, select each app, and click **Sync schema**:
-   - `Personal Notes Web` should list **7** tools.
+   - `Personal Notes Web` should list **8** tools (including `web_search`).
    - `GitHub Personal` should list **12** tools (with `destructiveHint=True` on all 6 write tools).
 5. **Prevent note-tool hijacking**: If you do not store study notes in Google Keep, consider disabling the built-in **Google Keep** extension under Connected Apps so prompts like `"Check my notes..."` are not diverted away from your MCP server. Toggle the custom apps off/on once and refresh the browser tab after syncing schemas.
 
@@ -93,14 +97,18 @@ Paste these four cards into **Settings → Instructions for Gemini / Saved info*
 Always proactively invoke the @GitHub Personal MCP tools—even if I do not explicitly type @GitHub Personal—for any request involving GitHub, including GitHub URLs, repositories, source code, directories, READMEs, commits, branches, issues, pull requests, releases, actions, code downloads, or my personal account <your-github-username>. Prefer @GitHub Personal over built-in web search for all GitHub lookups. If a needed GitHub capability (such as viewing commit diffs, issues/PR details, workflow runs, or downloading repo archives) is hidden, query search_tools using ENGLISH keywords and invoke via call_tool. If @GitHub Personal is not mounted in the current session, do not fabricate repo details—simply ask me to reply with "@GitHub Personal". Always ask for my explicit confirmation before performing any write or mutating operation (modifying files, creating branches, pushing commits, opening issues, or submitting PRs).
 ```
 
-### Card 3: General Web Access & Firecrawl Fallback
+### Card 3: Two-Stage Web Search & Firecrawl Fallback
 ```text
-For general web queries and public URLs outside <notes-domain> and GitHub, start with built-in web search and web reading. If built-in search/reading fails, hits an access restriction (such as GOOGLE_EXTENDED_OPT_OUT), returns incomplete content, or requires crawling sub-links, JS rendering, structured extraction, browser interaction, or remote PDF parsing: (1) if @Personal Notes Web is available in the current session, immediately use its web/Firecrawl tools (query search_tools using ENGLISH keywords and invoke via call_tool for crawl/batch/extract/PDF/interact tools) instead of saying you cannot access the site; (2) if @Personal Notes Web is not mounted in the current session, do not ask me to paste the webpage—simply tell me briefly to reply with "@Personal Notes Web" so it mounts and fetches the page. When web_scrape or web_scrape_pdf returns truncated=True, continue reading via offset=next_offset or find_keyword (which reads from local cache at 0 extra Firecrawl credits). Never use web tools as a general search engine; prefer web_map followed by web_scrape for targeted sub-pages; ask confirmation before passing confirm_large=True; and always call web_interact_stop immediately after finishing any interactive browser session.
+For general web queries and public URLs outside <notes-domain> and GitHub, ALWAYS follow a two-stage search workflow:
+Stage 1 (Default): Proactively use built-in Google web search and reading first (free) for all initial lookups.
+Stage 2 (Firecrawl Escalation): Escalate to @Personal Notes Web ONLY when Stage 1 (a) returns no relevant results, (b) produces vague, conflicting, or secondary-only snippets that you cannot confidently verify (such as official application requirements, deadlines, policies, recent releases, or niche terms in any field), (c) is about to lead to a negative claim ("X does not exist / was never released / is not offered"), or (d) fails/gets blocked when reading a target URL (e.g., GOOGLE_EXTENDED_OPT_OUT, JS-rendered pages, incomplete text, or browser interaction).
+When escalating: (1) if @Personal Notes Web is mounted, run web_search (2-credit snippet search, optionally with tbs recency filter) and then call web_scrape on ONLY the 1–2 most relevant primary-source URLs (never substitute web_search for routine Stage 1 queries); (2) if @Personal Notes Web is NOT mounted, do NOT assert that something does not exist or ask me to paste pages—simply tell me briefly to reply with "@Personal Notes Web" so it mounts and runs a second-opinion check.
+When web_scrape or web_scrape_pdf returns truncated=True, continue reading via offset=next_offset or find_keyword (0 extra credits from local cache). Ask confirmation before passing confirm_large=True, and always call web_interact_stop immediately after any interactive browser session.
 ```
 
-### Card 4: Factual Verification & Citation Discipline
+### Card 4: Factual Verification & Anti-False-Negative Discipline
 ```text
-For questions involving public external facts, official regulations, statistics, product specs, time-sensitive events, or community opinions, do not rely solely on internal memory—verify them using actual tool outputs from the current session (built-in web search/reading or @Personal Notes Web) and cite the real sources. Never fabricate facts, links, or tool outputs. If verification fails or returns no supporting evidence, explicitly state that no verified evidence was found. This web-verification requirement does not apply when answering directly from @Personal Notes Web course notes (when explicitly requested), @GitHub Personal, or pure logic/math derivation.
+For questions involving public external facts, official regulations, application requirements, deadlines, statistics, product specs, time-sensitive events, or community opinions, do not rely solely on internal memory—verify them using actual tool outputs from the current session (built-in web search/reading first, escalating to @Personal Notes Web web_search/web_scrape when built-in search is inconclusive) and cite the real sources. Never fabricate facts, links, or tool outputs. Before concluding that something does not exist, was not released, or has no official record, perform a second-opinion verification via @Personal Notes Web (or briefly ask me to reply with "@Personal Notes Web" if not mounted); only state that no verified evidence was found after verification genuinely fails. This web-verification requirement does not apply when answering directly from @Personal Notes Web course notes (when explicitly requested), @GitHub Personal, or pure logic/math derivation.
 ```
 
 ---
@@ -111,6 +119,7 @@ Test each prompt in a **brand-new conversation** to verify pre-routing and tool 
 
 1. **Notes + BM25 hidden tools**: `"Check my notes and show the folder tree and outline of a course."` → invokes `notes_list_shares`, then `search_tools` + `call_tool` for `notes_get_share_tree` / `notes_get_document_outline`.
 2. **No unsolicited notes lookup**: `"Prove that F[x] over a field F is a principal ideal domain."` → answers directly without touching `@Personal Notes Web`.
-3. **Web scrape + cache pagination**: Ask to scrape a long webpage or PDF, then ask to continue reading via `offset` or `find_keyword` → returns `cached: true` on follow-up slices.
-4. **GitHub read & archive link (Web & iOS)**: `"List my latest repositories on GitHub and give me a zip download link for one."` → locates `gh_get_archive_download_url` via `search_tools`.
-5. **Write confirmation & owner guard**: `"Create a branch and open a PR on one of my repos"` → asks for explicit confirmation before calling `gh_create_branch` / `gh_create_pull_request`; mutating an owner outside `GITHUB_ALLOWED_WRITE_OWNERS` is rejected by the server.
+3. **Two-stage search & second-opinion fallback**: Ask a routine factual question (stays on built-in Google Search at 0 credits), then ask a niche/recent verification or official admissions/release check with `@Personal Notes Web` mounted → runs `web_search` (2 credits) and selectively `web_scrape` on 1–2 URLs.
+4. **Web scrape + cache pagination**: Ask to scrape a long webpage or PDF, then ask to continue reading via `offset` or `find_keyword` → returns `cached: true` on follow-up slices.
+5. **GitHub read & archive link (Web & iOS)**: `"List my latest repositories on GitHub and give me a zip download link for one."` → locates `gh_get_archive_download_url` via `search_tools`.
+6. **Write confirmation & owner guard**: `"Create a branch and open a PR on one of my repos"` → asks for explicit confirmation before calling `gh_create_branch` / `gh_create_pull_request`; mutating an owner outside `GITHUB_ALLOWED_WRITE_OWNERS` is rejected by the server.

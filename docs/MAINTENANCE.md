@@ -24,7 +24,7 @@ This guide documents repository layout, design boundaries, testing, CI/CD workfl
 │   ├── GEMINI_SETUP.md            # Token setup, Gemini registration, Saved Info cards & checks
 │   └── MAINTENANCE.md             # This file
 ├── servers/
-│   ├── notes_web.py               # Server 1: SiYuan Notes RPC wrapper (5) + Firecrawl v2 (11)
+│   ├── notes_web.py               # Server 1: SiYuan Notes RPC wrapper (5) + Firecrawl v2 (12)
 │   └── github_personal.py         # Server 2: GitHub REST API wrapper (23)
 ├── tests/
 │   ├── test_bm25_recall.py        # Tool counts, annotations, BM25 recall, mock integration & ASGI HTTP smoke

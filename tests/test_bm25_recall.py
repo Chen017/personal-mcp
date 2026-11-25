@@ -65,11 +65,12 @@ async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
     async with Client(notes_web.mcp) as c1:
         tools1 = await c1.list_tools()
     names1 = [t.name for t in tools1]
-    assert len(names1) == 7, f"Expected 7 tools on Server 1, got {len(names1)}: {names1}"
+    assert len(names1) == 8, f"Expected 8 tools on Server 1, got {len(names1)}: {names1}"
     assert set(names1) == {
         "notes_search_notes",
         "notes_read_document",
         "notes_list_shares",
+        "web_search",
         "web_scrape",
         "web_map",
         "search_tools",
@@ -263,6 +264,46 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
                             "metadata": {"sourceURL": f"https://example.com/b{i}"},
                         }
                         for i in range(4)
+                    ],
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v2/search":
+            assert "scrapeOptions" not in (payload or {})
+            q = (payload or {}).get("query")
+            if q == "third party harness":
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "web": [
+                                {
+                                    "url": "https://example.com/harness-docs",
+                                    "title": "Harness Docs",
+                                    "description": "Official harness guide",
+                                }
+                            ],
+                            "news": [
+                                {
+                                    "url": "https://news.example.com/harness",
+                                    "title": "Harness Released",
+                                    "snippet": "Launched recently",
+                                    "date": "2026-11-20",
+                                }
+                            ],
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": [
+                        {
+                            "url": "https://example.com/list-result",
+                            "title": "List Shape Result",
+                            "highlights": ["Matched snippet"],
+                        }
                     ],
                 },
             )
@@ -473,6 +514,51 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
             )
             assert r_credits["data"]["remainingCredits"] == 4500
 
+            # 7) web_search: limit clamped <=10, no scrapeOptions, dict+list shapes, repeat cache & refresh
+            r_ws1 = _parse_tool_payload(
+                await client.call_tool(
+                    "web_search",
+                    {"query": "third party harness", "limit": 50, "tbs": "qdr:w", "country": "us"},
+                )
+            )
+            assert r_ws1["limit"] == 10
+            assert r_ws1["cached"] is False
+            assert r_ws1["count"] == 2
+            assert {item["source"] for item in r_ws1["results"]} == {"web", "news"}
+            search_calls = [(m, p, body) for m, p, body in recorded_fc if (m, p) == ("POST", "/v2/search")]
+            assert len(search_calls) == 1
+            assert search_calls[0][2] == {
+                "query": "third party harness",
+                "limit": 10,
+                "tbs": "qdr:w",
+                "country": "US",
+            }
+
+            r_ws_cached = _parse_tool_payload(
+                await client.call_tool(
+                    "web_search",
+                    {"query": "third party harness", "limit": 50, "tbs": "qdr:w", "country": "us"},
+                )
+            )
+            assert r_ws_cached["cached"] is True
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/search")) == 1
+
+            r_ws_refresh = _parse_tool_payload(
+                await client.call_tool(
+                    "web_search",
+                    {"query": "third party harness", "limit": 50, "tbs": "qdr:w", "country": "us", "refresh": True},
+                )
+            )
+            assert r_ws_refresh["cached"] is False
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/search")) == 2
+
+            r_ws_list = _parse_tool_payload(await client.call_tool("web_search", {"query": "list shape"}))
+            assert r_ws_list["count"] == 1
+            assert r_ws_list["results"][0]["description"] == "Matched snippet"
+
+            r_ws_err = _parse_tool_payload(await client.call_tool("web_search", {"query": "   "}))
+            assert r_ws_err["isError"] is True
+
         def broken_notes(_request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused")
 
@@ -635,7 +721,7 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.asyncio
 async def test_stateless_streamable_http_smoke() -> None:
-    for server_mod, expected_count in ((notes_web, 7), (github_personal, 12)):
+    for server_mod, expected_count in ((notes_web, 8), (github_personal, 12)):
         app = server_mod.create_http_app()
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(

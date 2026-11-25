@@ -46,9 +46,9 @@ This repository solves those with two isolated, stateless FastMCP servers behind
 │ Server 1: Personal Notes Web (:8101)  │   │ Server 2: GitHub Personal (:8102)     │
 │ systemd: mcp-notes-web.service        │   │ systemd: mcp-github.service           │
 │                                       │   │                                       │
-│ • 16 backend tools -> 7 exposed       │   │ • 23 backend tools -> 12 exposed      │
+│ • 17 backend tools -> 8 exposed       │   │ • 23 backend tools -> 12 exposed      │
 │ • SiYuan Notes RPC client (5 tools)   │   │ • Shared httpx -> GitHub REST API     │
-│ • Firecrawl v2 wrapper (11 tools)     │   │ • Fine-Grained PAT + owner allowlist  │
+│ • Firecrawl v2 wrapper (12 tools)     │   │ • Fine-Grained PAT + owner allowlist  │
 │ • Local LRU+TTL cache + offset paging │   │ • ALL 6 write tools pinned directly   │
 │ • BM25SearchTransform (Markdown)      │   │ • BM25SearchTransform (Markdown)      │
 └───────────────────────────────────────┘   └───────────────────────────────────────┘
@@ -63,7 +63,7 @@ This repository solves those with two isolated, stateless FastMCP servers behind
 
 | Server | Port | Exposed (`list_tools`) | Backend Total | Pinned Tools (`always_visible`) | BM25 Hidden Tools (`search_tools` + `call_tool`) |
 | :--- | :---: | :---: | :---: | :--- | :--- |
-| **Personal Notes Web** (`servers.notes_web`) | `127.0.0.1:8101` | **7** | **16** | `notes_search_notes`, `notes_read_document`, `notes_list_shares`, `web_scrape`, `web_map` | `notes_get_share_tree`, `notes_get_document_outline`, `web_crawl`, `web_crawl_status`, `web_batch_scrape`, `web_extract_structured`, `web_scrape_pdf`, `web_interact_start`, `web_interact_action`, `web_interact_stop`, `web_check_credit_usage` |
+| **Personal Notes Web** (`servers.notes_web`) | `127.0.0.1:8101` | **8** | **17** | `notes_search_notes`, `notes_read_document`, `notes_list_shares`, `web_search`, `web_scrape`, `web_map` | `notes_get_share_tree`, `notes_get_document_outline`, `web_crawl`, `web_crawl_status`, `web_batch_scrape`, `web_extract_structured`, `web_scrape_pdf`, `web_interact_start`, `web_interact_action`, `web_interact_stop`, `web_check_credit_usage` |
 | **GitHub Personal** (`servers.github_personal`) | `127.0.0.1:8102` | **12** | **23** | **4 Read**: `gh_list_repos`, `gh_get_repo_tree`, `gh_get_file_contents`, `gh_search_code`<br>**6 Write (`destructiveHint=True`)**: `gh_create_or_update_file`, `gh_create_pull_request`, `gh_create_branch`, `gh_push_multiple_files`, `gh_create_issue`, `gh_comment_issue_or_pr` | **13 Read / Download**: `gh_get_repo_info`, `gh_list_branches`, `gh_list_commits`, `gh_get_commit_diff`, `gh_compare_commits`, `gh_list_issues`, `gh_get_issue`, `gh_list_pull_requests`, `gh_get_pull_request_detail`, `gh_list_releases`, `gh_list_workflow_runs`, `gh_get_archive_download_url`, `gh_fetch_directory_bundle` |
 
 ---
@@ -73,7 +73,7 @@ This repository solves those with two isolated, stateless FastMCP servers behind
 - **Stateless Streamable HTTP (`stateless_http=True`)**: Every JSON-RPC call is self-contained with zero in-memory session affinity, preventing `404 Session terminated` errors across mobile reconnects or `systemd` restarts.
 - **Write Safety Preserved**: All 6 GitHub mutating tools are pinned in `always_visible` with `destructiveHint=True` (never hidden behind `call_tool`) and enforced server-side by `GITHUB_ALLOWED_WRITE_OWNERS` (fail-closed if unconfigured).
 - **Zero-Credit Local Cache Pagination**: `web_scrape` and `web_scrape_pdf` cache full extracted Markdown in an LRU + TTL memory store (`WEB_CACHE_TTL_SECONDS=1800`). Follow-up `offset` reads and `find_keyword` jumps consume **0 extra Firecrawl credits**, while each read is capped at `MAX_SINGLE_READ_CHARS` (default `32000`).
-- **Soft Guardrails Without Dead-Ends**: `web_crawl`, `web_batch_scrape`, and `web_extract_structured` pause and return `needs_confirmation=True` above configurable thresholds unless `confirm_large=True` is passed. `firecrawl_search` is intentionally omitted.
+- **Soft Guardrails Without Dead-Ends**: `web_search` is hard-capped at `limit <= 10` without `scrapeOptions` (strictly 2 credits per call, with identical repeat queries cached locally) as a second-opinion fallback behind built-in search; `web_crawl`, `web_batch_scrape`, and `web_extract_structured` pause and return `needs_confirmation=True` above configurable thresholds unless `confirm_large=True` is passed.
 - **Privacy & Log Redaction**: Capability URLs use 64-hex random paths paired with `access_log off` (Nginx) / `log_skip` (Caddy) and `proxy_buffering off`.
 
 ---
