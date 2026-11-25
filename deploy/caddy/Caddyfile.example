@@ -1,8 +1,8 @@
-mcp.yourdomain.com {
-    log_skip /<SECRET_PATH_ETALIB>/mcp
+mcp.example.com {
+    log_skip /<SECRET_PATH_NOTES>/mcp
     log_skip /<SECRET_PATH_GITHUB>/mcp
 
-    handle /<SECRET_PATH_ETALIB>/mcp {
+    handle /<SECRET_PATH_NOTES>/mcp {
         rewrite * /mcp
         reverse_proxy 127.0.0.1:8101 {
             flush_interval -1
@@ -19,5 +19,5 @@ mcp.yourdomain.com {
     }
 }
 
-# 务必同步在 note.etalib.space 的 Caddy reverse_proxy 块中添加：
-# header_up -X-MCP-Internal-Token
+# IMPORTANT: In your public SiYuan Share site (e.g. notes.example.com) Caddy block, add:
+#   header_up -X-MCP-Internal-Token

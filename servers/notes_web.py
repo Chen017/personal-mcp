@@ -19,12 +19,28 @@ from common.utils import format_http_error, truncate_text
 
 load_dotenv()
 
-SERVER_INSTRUCTIONS = """
-Primary MCP server for the user's personal notes (Etalib Notes on note.etalib.space) and full-featured web/blog/PDF reader (Firecrawl v2):
-1. Personal Notes & Coursework (note.etalib.space / SiYuan Notes / 我的笔记、思源笔记、课程笔记):
-   Use this server whenever the user says "check my notes", "my notes", "search my notes", "course notes", "lectures", or shares a note.etalib.space link. This is the user's real notes repository (distinct from Google Keep or Google Drive). Supports listing notebooks (`notes_list_shares`), searching notes (`notes_search_notes`), reading clean Markdown with LaTeX (`notes_read_document`), browsing course trees (`notes_get_share_tree`), and inspecting document outlines (`notes_get_document_outline`).
-2. Webpage, Blog & Remote PDF Reader (www.etalib.space, etalib.space, and any external website / 抓取网页、博客文章、解析远程PDF):
-   Directly fetch, read, map, crawl, extract structured JSON, parse remote PDFs, and interact with webpages — including www.etalib.space, etalib.space, JS-rendered sites, documentation sites, and external PDFs.
+
+def _notes_mcp_name() -> str:
+    return os.getenv("NOTES_MCP_NAME", "Personal Notes Web").strip() or "Personal Notes Web"
+
+
+def _notes_site_domain() -> str:
+    return os.getenv("NOTES_SITE_DOMAIN", "notes.example.com").strip() or "notes.example.com"
+
+
+def _blog_site_domain() -> str:
+    return os.getenv("BLOG_SITE_DOMAIN", "blog.example.com").strip() or "blog.example.com"
+
+
+def _build_server_instructions() -> str:
+    notes_domain = _notes_site_domain()
+    blog_domain = _blog_site_domain()
+    return f"""
+Primary MCP server for the user's personal notes (SiYuan Notes on {notes_domain}) and full-featured web/blog/PDF reader (Firecrawl v2):
+1. Personal Notes & Coursework ({notes_domain} / SiYuan Notes / 我的笔记、思源笔记、课程笔记):
+   Use this server whenever the user says "check my notes", "my notes", "search my notes", "course notes", "lectures", or shares a {notes_domain} link. This is the user's real notes repository (distinct from Google Keep or Google Drive). Supports listing notebooks (`notes_list_shares`), searching notes (`notes_search_notes`), reading clean Markdown with LaTeX (`notes_read_document`), browsing course trees (`notes_get_share_tree`), and inspecting document outlines (`notes_get_document_outline`).
+2. Webpage, Blog & Remote PDF Reader ({blog_domain}, {notes_domain}, and any external website / 抓取网页、博客文章、解析远程PDF):
+   Directly fetch, read, map, crawl, extract structured JSON, parse remote PDFs, and interact with webpages — including {blog_domain}, JS-rendered sites, documentation sites, and external PDFs.
    - `web_scrape` and `web_scrape_pdf` cache full Markdown locally in memory (TTL ~30 min) and support `offset` pagination + `find_keyword` jumping at zero extra Firecrawl credits.
    - Multi-page tools (`web_crawl`, `web_batch_scrape`, `web_extract_structured`) use soft confirmation thresholds (`confirm_large=True` to proceed on large batches).
 
@@ -32,6 +48,7 @@ For hidden tools, always pass ENGLISH keywords to `search_tools`, then invoke vi
 - Notes: browse notebook folder hierarchy tree (`notes_get_share_tree`), inspect document headings/TOC and offsets (`notes_get_document_outline`).
 - Web/Firecrawl: multi-page crawl (`web_crawl`, `web_crawl_status`), batch URL scraping (`web_batch_scrape`), structured JSON extraction (`web_extract_structured`), remote PDF parsing (`web_scrape_pdf`), browser interactive click/form sessions (`web_interact_start`, `web_interact_action`, `web_interact_stop` - stop after finishing), and credit usage check (`web_check_credit_usage`).
 """.strip()
+
 
 PINNED_TOOLS = [
     "notes_search_notes",
@@ -48,8 +65,8 @@ READ_ONLY_ANNOTATIONS = {
 }
 
 mcp = FastMCP(
-    name="Etalib Notes Web",
-    instructions=SERVER_INSTRUCTIONS,
+    name=_notes_mcp_name(),
+    instructions=_build_server_instructions(),
     transforms=[
         BM25SearchTransform(
             max_results=6,
@@ -265,10 +282,10 @@ def _paginate_page_items(
 
 
 def _get_notes_client() -> tuple[httpx.AsyncClient | None, str | None, str]:
-    rpc_url = os.getenv("ETALIB_NOTES_RPC_URL", "http://127.0.0.1:8081/mcp").strip()
-    token = os.getenv("ETALIB_NOTES_INTERNAL_TOKEN", "").strip()
+    rpc_url = os.getenv("NOTES_RPC_URL", "http://127.0.0.1:8081/mcp").strip()
+    token = os.getenv("NOTES_INTERNAL_TOKEN", "").strip()
     if not token:
-        return None, "ETALIB_NOTES_INTERNAL_TOKEN is not configured.", rpc_url
+        return None, "NOTES_INTERNAL_TOKEN is not configured.", rpc_url
     loop = asyncio.get_running_loop()
     bucket = _loop_clients.setdefault(loop, {})
     cache_key = f"{rpc_url}|{token}|{id(_test_transports['notes'])}"
@@ -314,7 +331,7 @@ def _get_firecrawl_client() -> tuple[httpx.AsyncClient | None, str | None]:
 async def _call_siyuan_notes(tool_name: str, arguments: dict) -> dict:
     client, err, rpc_url = _get_notes_client()
     if err or client is None:
-        return {"isError": True, "error": err or "Etalib Notes client unavailable."}
+        return {"isError": True, "error": err or "SiYuan Notes client unavailable."}
     payload = {
         "jsonrpc": "2.0",
         "id": uuid.uuid4().hex,
@@ -326,10 +343,10 @@ async def _call_siyuan_notes(tool_name: str, arguments: dict) -> dict:
         resp.raise_for_status()
         body = resp.json()
     except Exception as exc:
-        return {"isError": True, "error": format_http_error("Etalib Notes upstream", exc)}
+        return {"isError": True, "error": format_http_error("Notes upstream", exc)}
 
     if "error" in body:
-        return {"isError": True, "error": f"Etalib Notes RPC error: {body['error']}"}
+        return {"isError": True, "error": f"Notes RPC error: {body['error']}"}
     result = body.get("result") or {}
     if result.get("isError"):
         texts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
@@ -368,12 +385,12 @@ def _extract_scrape_id(scrape_resp: dict) -> str:
     return ""
 
 
-# ==================== 1. SiYuan Notes 工具（5 个：3 置顶 + 2 隐藏） ====================
+# ==================== 1. SiYuan Notes Tools (5 total: 3 pinned + 2 hidden) ====================
 
 
 @mcp.tool(annotations={"title": "List Personal Note Notebooks", **READ_ONLY_ANNOTATIONS})
 async def notes_list_shares(cursor: str = "") -> dict:
-    """List all of the user's personal SiYuan shared notebooks and top-level course nodes on note.etalib.space (use when the user asks to check my notes / 列出我的思源笔记库和课程).
+    """List all of the user's personal SiYuan shared notebooks and top-level course nodes (use when the user asks to check my notes / 列出我的思源笔记库和课程).
     Keywords: siyuan notes list shares notebooks courses catalog index check my notes.
     """
     args = {"cursor": cursor} if cursor else {}
@@ -387,7 +404,7 @@ async def notes_search_notes(
     parent_doc_id: str = "",
     limit: int = 20,
 ) -> dict:
-    """Search the user's personal SiYuan notes on note.etalib.space by keywords across all notebooks or a course subtree (use for "check my notes", "search my notes", theorems, definitions, lectures / 检索我的笔记和课程讲义).
+    """Search the user's personal SiYuan notes by keywords across all notebooks or a course subtree (use for "check my notes", "search my notes", theorems, definitions, lectures / 检索我的笔记和课程讲义).
     Keywords: siyuan notes search find theorem definition lecture query check my notes.
     """
     args: dict = {"query": query, "limit": max(1, min(limit, 50))}
@@ -405,7 +422,7 @@ async def notes_read_document(
     offset: int = 0,
     max_chars: int | None = None,
 ) -> dict:
-    """Read clean Markdown of a personal SiYuan note on note.etalib.space with LaTeX preserved and offset pagination (读取我的思源笔记正文，支持 note.etalib.space 链接).
+    """Read clean Markdown of a personal SiYuan note with LaTeX preserved and offset pagination (读取我的思源笔记正文，支持分享链接与分段阅读).
     Keywords: siyuan notes read document content markdown latex offset check my notes.
     """
     effective_max = max_chars if max_chars is not None else _default_note_chars()
@@ -442,7 +459,7 @@ async def notes_get_document_outline(share: str, doc_id: str = "") -> dict:
     return await _call_siyuan_notes("get_document_outline", args)
 
 
-# ==================== 2. Firecrawl v2 工具（11 个：2 置顶 + 9 隐藏） ====================
+# ==================== 2. Firecrawl v2 Tools (11 total: 2 pinned + 9 hidden) ====================
 
 
 @mcp.tool(annotations={"title": "Scrape Webpage (Firecrawl v2 + Cache Pagination)", **READ_ONLY_ANNOTATIONS})
@@ -455,8 +472,8 @@ async def web_scrape(
     wait_for_ms: int = 0,
     refresh: bool = False,
 ) -> dict:
-    """Fetch and read any webpage, blog post, or article (including www.etalib.space, etalib.space, JS-rendered sites, and any external URL) into clean Markdown, cached locally for zero-credit `offset` pagination and `find_keyword` jumping (抓取并读取任意网页、个人博客或文章正文，支持缓存续读).
-    Keywords: firecrawl scrape webpage url read article markdown js render opt_out etalib blog offset cache.
+    """Fetch and read any webpage, blog post, or article (including personal blogs, JS-rendered sites, and any external URL) into clean Markdown, cached locally for zero-credit `offset` pagination and `find_keyword` jumping (抓取并读取任意网页、个人博客或文章正文，支持缓存续读).
+    Keywords: firecrawl scrape webpage url read article markdown js render opt_out blog offset cache.
     """
     variant = f"main={only_main_content}"
     cached_entry = None if refresh else _get_cached_web("scrape", url, variant)
@@ -485,7 +502,7 @@ async def web_scrape(
 
 @mcp.tool(annotations={"title": "Map Website Sub-links (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
 async def web_map(url: str, search: str = "", limit: int = 50) -> dict:
-    """Discover and enumerate sub-page URLs under any website (including www.etalib.space or external docs/blogs) before selectively scraping target pages (扫描并列出网站子页面和文章链接列表).
+    """Discover and enumerate sub-page URLs under any website (blogs, docs, or external sites) before selectively scraping target pages (扫描并列出网站子页面和文章链接列表).
     Keywords: firecrawl map sitemap links directory subpages discover urls.
     """
     payload: dict[str, Any] = {"url": url, "limit": max(1, limit)}

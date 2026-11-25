@@ -1,5 +1,5 @@
 [Unit]
-Description=Personal FastMCP Server - Etalib Web (SiYuan Notes + Firecrawl v2)
+Description=Personal FastMCP Server - Notes & Web (SiYuan Notes + Firecrawl v2)
 After=network.target docker.service
 
 [Service]
@@ -7,7 +7,7 @@ Type=simple
 User=YOUR_DEBIAN_USER
 WorkingDirectory=/opt/personal-mcp
 EnvironmentFile=/opt/personal-mcp/.env
-ExecStart=/opt/personal-mcp/.venv/bin/python -m servers.etalib_web
+ExecStart=/opt/personal-mcp/.venv/bin/python -m servers.notes_web
 Restart=always
 RestartSec=3
 

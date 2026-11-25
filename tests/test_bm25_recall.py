@@ -9,7 +9,7 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from servers import etalib_web, github_personal
+from servers import github_personal, notes_web
 
 
 def _extract_tool_names_from_search_output(result: Any) -> list[str]:
@@ -23,7 +23,6 @@ def _extract_tool_names_from_search_output(result: Any) -> list[str]:
     if not combined and getattr(result, "data", None) is not None:
         combined = str(result.data)
 
-    # Markdown serializer formats headings like `### tool_name` or `**tool_name**` or `- **tool_name**`
     names: list[str] = []
     for match in re.finditer(r"(?:^|\n)\s*(?:#{1,4}\s+|[-*]\s+\*\*|\*\*)([a-z][a-z0-9_]+)", combined):
         candidate = match.group(1)
@@ -57,14 +56,13 @@ def _parse_tool_payload(result: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
-    assert etalib_web.mcp.name == "Etalib Notes Web"
+    instructions1 = notes_web._build_server_instructions()
     for forbidden_phrase in ("ONLY invoke", "Do NOT use", "when built-in browsing fails", "fallback web scraping"):
-        assert forbidden_phrase not in etalib_web.SERVER_INSTRUCTIONS
-    assert "check my notes" in etalib_web.SERVER_INSTRUCTIONS
-    assert "www.etalib.space" in etalib_web.SERVER_INSTRUCTIONS
+        assert forbidden_phrase not in instructions1
+    assert "check my notes" in instructions1
     assert "我的仓库" in github_personal.SERVER_INSTRUCTIONS
 
-    async with Client(etalib_web.mcp) as c1:
+    async with Client(notes_web.mcp) as c1:
         tools1 = await c1.list_tools()
     names1 = [t.name for t in tools1]
     assert len(names1) == 7, f"Expected 7 tools on Server 1, got {len(names1)}: {names1}"
@@ -80,7 +78,7 @@ async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
     assert "firecrawl_search" not in names1
 
     for tool in tools1:
-        schema = tool.inputSchema
+        schema = tool.input_schema
         assert schema.get("type") == "object"
         assert "$defs" not in json.dumps(schema), f"Nested $defs found in {tool.name}: {schema}"
 
@@ -101,11 +99,11 @@ async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
     by_name2 = {t.name: t for t in tools2}
     for wname in expected_writes:
         ann = by_name2[wname].annotations
-        assert ann is not None and ann.destructiveHint is True, f"{wname} must expose destructiveHint=True"
-        assert ann.readOnlyHint is False, f"{wname} must expose readOnlyHint=False"
+        assert ann is not None and ann.destructive_hint is True, f"{wname} must expose destructive_hint=True"
+        assert ann.read_only_hint is False, f"{wname} must expose read_only_hint=False"
 
     for tool in tools2:
-        schema = tool.inputSchema
+        schema = tool.input_schema
         assert schema.get("type") == "object"
         assert "$defs" not in json.dumps(schema), f"Nested $defs found in {tool.name}: {schema}"
 
@@ -120,7 +118,7 @@ async def test_bm25_english_recall_top3() -> None:
         ("extract structured json schema", {"web_extract_structured"}),
         ("click button interact browser", {"web_interact_action", "web_interact_start"}),
     ]
-    async with Client(etalib_web.mcp) as c1:
+    async with Client(notes_web.mcp) as c1:
         for query, expected_any in server1_queries:
             res = await c1.call_tool("search_tools", {"query": query})
             ranked = _extract_tool_names_from_search_output(res)
@@ -129,7 +127,6 @@ async def test_bm25_english_recall_top3() -> None:
                 f"Server 1 BM25 failed for {query!r}: expected one of {expected_any} in top3, got {ranked}"
             )
 
-        # Ensure firecrawl_search is never indexed or exposed
         fc_search_res = await c1.call_tool("search_tools", {"query": "firecrawl_search"})
         assert "firecrawl_search" not in _extract_tool_names_from_search_output(fc_search_res)
 
@@ -150,9 +147,9 @@ async def test_bm25_english_recall_top3() -> None:
 
 
 @pytest.mark.asyncio
-async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ETALIB_NOTES_RPC_URL", "http://127.0.0.1:8081/mcp")
-    monkeypatch.setenv("ETALIB_NOTES_INTERNAL_TOKEN", "internal-secret-token")
+async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NOTES_RPC_URL", "http://127.0.0.1:8081/mcp")
+    monkeypatch.setenv("NOTES_INTERNAL_TOKEN", "internal-secret-token")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
     monkeypatch.setenv("FIRECRAWL_API_BASE_URL", "https://api.firecrawl.dev/v2")
     monkeypatch.setenv("MAX_SINGLE_READ_CHARS", "2000")
@@ -178,7 +175,7 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
                     "id": body["id"],
                     "result": {
                         "structuredContent": {
-                            "shares": [{"slug": "sem5note", "title": "GTIIT 5th Semester"}],
+                            "shares": [{"slug": "demo-notebook", "title": "Sample Course Notebook"}],
                             "total_returned": 1,
                         },
                         "isError": False,
@@ -273,40 +270,39 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             return httpx.Response(200, json={"success": True, "status": "completed", "data": {"title": "OK"}})
         return httpx.Response(404, json={"error": "not found"})
 
-    etalib_web.set_test_transports(
+    notes_web.set_test_transports(
         notes=httpx.MockTransport(notes_handler),
         firecrawl=httpx.MockTransport(fc_handler),
     )
     try:
-        async with Client(etalib_web.mcp) as client:
+        async with Client(notes_web.mcp) as client:
             r_shares = _parse_tool_payload(await client.call_tool("notes_list_shares", {}))
             assert r_shares["total_returned"] == 1
             assert recorded_notes[-1]["params"]["name"] == "list_shares"
 
             r_doc = _parse_tool_payload(
-                await client.call_tool("notes_read_document", {"share": "sem5note", "doc_id": "d1"})
+                await client.call_tool("notes_read_document", {"share": "demo-notebook", "doc_id": "d1"})
             )
             assert "smooth manifold" in r_doc["content"]
 
             # 1) web_scrape: first read hits Firecrawl once; paginated reads hit cache (0 extra hits)
             chunks: list[str] = []
             r1 = _parse_tool_payload(
-                await client.call_tool("web_scrape", {"url": "https://www.etalib.space", "max_chars": 1200})
+                await client.call_tool("web_scrape", {"url": "https://blog.example.com", "max_chars": 1200})
             )
             assert r1["cached"] is False
             assert r1["truncated"] is True
             assert r1["next_offset"] == 1200
             chunks.append(r1["markdown"])
 
-            scrape_calls_after_first = sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape"))
-            assert scrape_calls_after_first == 1
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape")) == 1
 
             offset = r1["next_offset"]
             while offset is not None:
                 rn = _parse_tool_payload(
                     await client.call_tool(
                         "web_scrape",
-                        {"url": "https://www.etalib.space", "offset": offset, "max_chars": 1200},
+                        {"url": "https://blog.example.com", "offset": offset, "max_chars": 1200},
                     )
                 )
                 assert rn["cached"] is True
@@ -369,7 +365,10 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             r_crawl_ok = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
-                    {"name": "web_crawl", "arguments": {"url": "https://example.com", "limit": 50, "confirm_large": True}},
+                    {
+                        "name": "web_crawl",
+                        "arguments": {"url": "https://example.com", "limit": 50, "confirm_large": True},
+                    },
                 )
             )
             assert r_crawl_ok["id"] == "crawl_999"
@@ -377,17 +376,17 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             r_crawl_p1 = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
-                    {"name": "web_crawl_status", "arguments": {"crawl_id": "crawl_999", "page_offset": 0, "page_limit": 2}},
+                    {
+                        "name": "web_crawl_status",
+                        "arguments": {"crawl_id": "crawl_999", "page_offset": 0, "page_limit": 2},
+                    },
                 )
             )
             assert r_crawl_p1["total_pages"] == 4
             assert r_crawl_p1["returned_pages"] == 2
             assert r_crawl_p1["next_page_offset"] == 2
 
-            # Crawled page should now be cached for web_scrape at 0 extra credits
-            r_warm = _parse_tool_payload(
-                await client.call_tool("web_scrape", {"url": "https://example.com/p3"})
-            )
+            r_warm = _parse_tool_payload(await client.call_tool("web_scrape", {"url": "https://example.com/p3"}))
             assert r_warm["cached"] is True
             assert "Crawled page 3" in r_warm["markdown"]
 
@@ -395,7 +394,10 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             r_batch_guard = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
-                    {"name": "web_batch_scrape", "arguments": {"urls": [f"https://example.com/b{i}" for i in range(4)]}},
+                    {
+                        "name": "web_batch_scrape",
+                        "arguments": {"urls": [f"https://example.com/b{i}" for i in range(4)]},
+                    },
                 )
             )
             assert r_batch_guard["needs_confirmation"] is True
@@ -460,7 +462,9 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             assert r_act["output"] == "Clicked button"
 
             r_stop = _parse_tool_payload(
-                await client.call_tool("call_tool", {"name": "web_interact_stop", "arguments": {"scrape_id": "scr_123"}})
+                await client.call_tool(
+                    "call_tool", {"name": "web_interact_stop", "arguments": {"scrape_id": "scr_123"}}
+                )
             )
             assert r_stop["creditsBilled"] == 2
 
@@ -469,24 +473,23 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             )
             assert r_credits["data"]["remainingCredits"] == 4500
 
-        # Upstream connection error must return clean isError without crashing server
         def broken_notes(_request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused")
 
-        etalib_web.set_test_transports(notes=httpx.MockTransport(broken_notes), firecrawl=None)
-        async with Client(etalib_web.mcp) as client:
+        notes_web.set_test_transports(notes=httpx.MockTransport(broken_notes), firecrawl=None)
+        async with Client(notes_web.mcp) as client:
             r_err = _parse_tool_payload(await client.call_tool("notes_list_shares", {}))
             assert r_err["isError"] is True
             assert "connection error" in r_err["error"]
     finally:
-        etalib_web.set_test_transports(notes=None, firecrawl=None)
+        notes_web.set_test_transports(notes=None, firecrawl=None)
 
 
 @pytest.mark.asyncio
 async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
-    monkeypatch.setenv("GITHUB_DEFAULT_OWNER", "Chen017")
-    monkeypatch.setenv("GITHUB_ALLOWED_WRITE_OWNERS", "Chen017")
+    monkeypatch.setenv("GITHUB_DEFAULT_OWNER", "alice")
+    monkeypatch.setenv("GITHUB_ALLOWED_WRITE_OWNERS", "alice")
     monkeypatch.setenv("GITHUB_API_BASE_URL", "https://api.github.com")
 
     calls: list[tuple[str, str, dict[str, Any]]] = []
@@ -501,18 +504,18 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
                 200,
                 json=[
                     {
-                        "full_name": "Chen017/demo",
+                        "full_name": "alice/demo",
                         "private": True,
                         "default_branch": "main",
                         "description": "Demo repo",
                         "updated_at": "2026-11-25T00:00:00Z",
-                        "html_url": "https://github.com/Chen017/demo",
+                        "html_url": "https://github.com/alice/demo",
                     }
                 ],
             )
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo":
             return httpx.Response(200, json={"default_branch": "main", "private": True})
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/git/trees/main":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/git/trees/main":
             return httpx.Response(
                 200,
                 json={
@@ -523,13 +526,13 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
                     ],
                 },
             )
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/contents/src":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/contents/src":
             return httpx.Response(200, json=[{"name": "app.py", "path": "src/app.py", "type": "file", "size": 100}])
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/contents/big.txt":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/contents/big.txt":
             if request.headers.get("Accept") == "application/vnd.github.raw+json":
                 return httpx.Response(200, content=b"line1\nline2\n")
             return httpx.Response(200, json={"path": "big.txt", "sha": "s1", "html_url": "https://gh/big.txt"})
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/contents/bin.dat":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/contents/bin.dat":
             return httpx.Response(
                 200,
                 json={
@@ -539,25 +542,26 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
                     "html_url": "https://gh/bin.dat",
                 },
             )
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/zipball/main":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/zipball/main":
             return httpx.Response(302, headers={"Location": "https://codeload.github.com/signed-zip-url"})
 
-        # Git Data API 6 steps for gh_push_multiple_files
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/git/ref/heads/feat":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/git/ref/heads/feat":
             return httpx.Response(200, json={"object": {"sha": "commit_base"}})
-        if request.method == "GET" and request.url.path == "/repos/Chen017/demo/git/commits/commit_base":
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/git/commits/commit_base":
             return httpx.Response(200, json={"tree": {"sha": "tree_base"}})
-        if request.method == "POST" and request.url.path == "/repos/Chen017/demo/git/blobs":
+        if request.method == "POST" and request.url.path == "/repos/alice/demo/git/blobs":
             return httpx.Response(201, json={"sha": f"blob_{len(body['content'])}"})
-        if request.method == "POST" and request.url.path == "/repos/Chen017/demo/git/trees":
+        if request.method == "POST" and request.url.path == "/repos/alice/demo/git/trees":
             assert body["base_tree"] == "tree_base"
             assert len(body["tree"]) == 2
             return httpx.Response(201, json={"sha": "tree_new"})
-        if request.method == "POST" and request.url.path == "/repos/Chen017/demo/git/commits":
+        if request.method == "POST" and request.url.path == "/repos/alice/demo/git/commits":
             assert body["tree"] == "tree_new"
             assert body["parents"] == ["commit_base"]
-            return httpx.Response(201, json={"sha": "commit_new", "html_url": "https://github.com/Chen017/demo/commit/commit_new"})
-        if request.method == "PATCH" and request.url.path == "/repos/Chen017/demo/git/refs/heads/feat":
+            return httpx.Response(
+                201, json={"sha": "commit_new", "html_url": "https://github.com/alice/demo/commit/commit_new"}
+            )
+        if request.method == "PATCH" and request.url.path == "/repos/alice/demo/git/refs/heads/feat":
             assert body["sha"] == "commit_new"
             return httpx.Response(200, json={"object": {"sha": "commit_new"}})
 
@@ -568,27 +572,25 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
         async with Client(github_personal.mcp) as client:
             repos = _parse_tool_payload(await client.call_tool("gh_list_repos", {}))
             assert repos["count"] == 1
-            assert repos["repos"][0]["full_name"] == "Chen017/demo"
+            assert repos["repos"][0]["full_name"] == "alice/demo"
 
-            tree = _parse_tool_payload(
-                await client.call_tool("gh_get_repo_tree", {"owner": "Chen017", "repo": "demo"})
-            )
+            tree = _parse_tool_payload(await client.call_tool("gh_get_repo_tree", {"owner": "alice", "repo": "demo"}))
             assert tree["tree_truncated_by_github"] is True
             assert [e["path"] for e in tree["entries"]] == ["src/app.py"]
 
             dir_res = _parse_tool_payload(
-                await client.call_tool("gh_get_file_contents", {"owner": "Chen017", "repo": "demo", "path": "src"})
+                await client.call_tool("gh_get_file_contents", {"owner": "alice", "repo": "demo", "path": "src"})
             )
             assert dir_res["type"] == "directory"
 
             big_res = _parse_tool_payload(
-                await client.call_tool("gh_get_file_contents", {"owner": "Chen017", "repo": "demo", "path": "big.txt"})
+                await client.call_tool("gh_get_file_contents", {"owner": "alice", "repo": "demo", "path": "big.txt"})
             )
             assert big_res["type"] == "file"
             assert "1: line1" in big_res["content"]
 
             bin_res = _parse_tool_payload(
-                await client.call_tool("gh_get_file_contents", {"owner": "Chen017", "repo": "demo", "path": "bin.dat"})
+                await client.call_tool("gh_get_file_contents", {"owner": "alice", "repo": "demo", "path": "bin.dat"})
             )
             assert bin_res["type"] == "binary"
 
@@ -605,7 +607,7 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
                 await client.call_tool(
                     "gh_push_multiple_files",
                     {
-                        "owner": "Chen017",
+                        "owner": "alice",
                         "repo": "demo",
                         "branch": "feat",
                         "file_paths": ["a.py", "b.py"],
@@ -622,7 +624,7 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
                     "call_tool",
                     {
                         "name": "gh_get_archive_download_url",
-                        "arguments": {"owner": "Chen017", "repo": "demo"},
+                        "arguments": {"owner": "alice", "repo": "demo"},
                     },
                 )
             )
@@ -633,7 +635,7 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.asyncio
 async def test_stateless_streamable_http_smoke() -> None:
-    for server_mod, expected_count in ((etalib_web, 7), (github_personal, 12)):
+    for server_mod, expected_count in ((notes_web, 7), (github_personal, 12)):
         app = server_mod.create_http_app()
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(
@@ -656,7 +658,6 @@ async def test_stateless_streamable_http_smoke() -> None:
                 )
                 assert init_resp.status_code == 200, init_resp.text
 
-                # Send tools/list WITHOUT Mcp-Session-Id header to verify stateless_http=True
                 list_resp = await http_client.post(
                     "/mcp",
                     headers={"Accept": "application/json, text/event-stream"},

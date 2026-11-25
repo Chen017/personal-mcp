@@ -1,0 +1,45 @@
+name: Deploy to VPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vps-deployment
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy via SSH
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Pull latest main and run deploy.sh on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          port: ${{ secrets.PORT }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -euo pipefail
+            INSTALL_DIR="${INSTALL_DIR:-/opt/personal-mcp}"
+            if [ -d "$INSTALL_DIR/.git" ]; then
+              cd "$INSTALL_DIR"
+              git fetch origin main
+              test "$(git rev-parse origin/main)" = "${{ github.sha }}" || {
+                echo "Remote main changed after CI; aborting deploy." >&2
+                exit 1
+              }
+              git merge --ff-only origin/main
+              NON_INTERACTIVE=1 bash deploy/deploy.sh
+            else
+              NON_INTERACTIVE=1 bash <(curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/main/deploy/deploy.sh")
+            fi

@@ -82,14 +82,20 @@ ENV_FILE="${INSTALL_DIR}/.env"
 if [ ! -f "$ENV_FILE" ]; then
     run_as_user cp "${INSTALL_DIR}/.env.example" "$ENV_FILE"
     INTERNAL_TOKEN="$(openssl rand -hex 32)"
-    SECRET_ETALIB="$(openssl rand -hex 32)"
+    SECRET_NOTES="$(openssl rand -hex 32)"
     SECRET_GITHUB="$(openssl rand -hex 32)"
 
     sed -i "s|replace_with_same_64_hex_as_php_config|${INTERNAL_TOKEN}|g" "$ENV_FILE"
-    sed -i "s|replace_with_64_hex_chars_1|${SECRET_ETALIB}|g" "$ENV_FILE"
+    sed -i "s|replace_with_64_hex_chars_1|${SECRET_NOTES}|g" "$ENV_FILE"
     sed -i "s|replace_with_64_hex_chars_2|${SECRET_GITHUB}|g" "$ENV_FILE"
 
     if [ "${NON_INTERACTIVE:-0}" != "1" ] && [ -r /dev/tty ]; then
+        printf "Enter your GitHub username (GITHUB_DEFAULT_OWNER, leave blank to fill later): " > /dev/tty
+        IFS= read -r INPUT_OWNER < /dev/tty || true
+        if [ -n "${INPUT_OWNER:-}" ]; then
+            sed -i "s|^GITHUB_DEFAULT_OWNER=.*|GITHUB_DEFAULT_OWNER=${INPUT_OWNER}|" "$ENV_FILE"
+            sed -i "s|^GITHUB_ALLOWED_WRITE_OWNERS=.*|GITHUB_ALLOWED_WRITE_OWNERS=${INPUT_OWNER}|" "$ENV_FILE"
+        fi
         printf "Enter FIRECRAWL_API_KEY (leave blank to fill later): " > /dev/tty
         IFS= read -r INPUT_FC < /dev/tty || true
         if [ -n "${INPUT_FC:-}" ]; then
@@ -109,7 +115,7 @@ else
 fi
 
 echo "==> [5/6] Installing and starting systemd services..."
-for svc in mcp-etalib-web.service mcp-github.service; do
+for svc in mcp-notes-web.service mcp-github.service; do
     SRC="${INSTALL_DIR}/deploy/systemd/${svc}"
     DST="/etc/systemd/system/${svc}"
     TMP_SVC="$(mktemp)"
@@ -119,8 +125,8 @@ for svc in mcp-etalib-web.service mcp-github.service; do
 done
 
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable mcp-etalib-web mcp-github
-$SUDO systemctl restart mcp-etalib-web mcp-github
+$SUDO systemctl enable mcp-notes-web mcp-github
+$SUDO systemctl restart mcp-notes-web mcp-github
 
 echo "==> [6/6] Running stateless Streamable HTTP health checks..."
 check_endpoint() {
@@ -145,7 +151,7 @@ check_endpoint() {
     return 1
 }
 
-check_endpoint "Etalib Web" 8101 "mcp-etalib-web"
+check_endpoint "Personal Notes Web" 8101 "mcp-notes-web"
 check_endpoint "GitHub Personal" 8102 "mcp-github"
 
 get_env_val() {
@@ -153,45 +159,46 @@ get_env_val() {
     grep -E "^${key}=" "$ENV_FILE" | head -n 1 | cut -d'=' -f2- || true
 }
 
-SECRET_ETALIB_VAL="$(get_env_val SECRET_PATH_ETALIB)"
+SECRET_NOTES_VAL="$(get_env_val SECRET_PATH_NOTES)"
 SECRET_GITHUB_VAL="$(get_env_val SECRET_PATH_GITHUB)"
-INTERNAL_TOKEN_VAL="$(get_env_val ETALIB_NOTES_INTERNAL_TOKEN)"
+INTERNAL_TOKEN_VAL="$(get_env_val NOTES_INTERNAL_TOKEN)"
 FC_VAL="$(get_env_val FIRECRAWL_API_KEY)"
 GH_VAL="$(get_env_val GITHUB_PAT)"
+OWNER_VAL="$(get_env_val GITHUB_DEFAULT_OWNER)"
 
 echo ""
 echo "======================================================================"
 echo " Deployment succeeded! Summary & Next Steps:"
 echo "======================================================================"
 echo "1) Service status:"
-echo "   sudo systemctl status mcp-etalib-web mcp-github"
+echo "   sudo systemctl status mcp-notes-web mcp-github"
 echo ""
-if [[ "$FC_VAL" == *"xxxx"* || "$GH_VAL" == *"xxxx"* ]]; then
-    echo "2) IMPORTANT - Fill remaining placeholder API keys in ${ENV_FILE}, then restart:"
+if [[ "$FC_VAL" == *"xxxx"* || "$GH_VAL" == *"xxxx"* || "$OWNER_VAL" == "your-github-username" ]]; then
+    echo "2) IMPORTANT - Fill remaining placeholders in ${ENV_FILE}, then restart:"
     echo "   nano ${ENV_FILE}"
-    echo "   sudo systemctl restart mcp-etalib-web mcp-github"
+    echo "   sudo systemctl restart mcp-notes-web mcp-github"
     echo ""
 fi
-echo "3) SiYuan Share php-site/config.php (add inside return [...]; and restart container):"
+echo "3) Optional SiYuan Share php-site/config.php (add inside return [...]; and restart container):"
 echo "   'mcp_internal_token' => '${INTERNAL_TOKEN_VAL}',"
 echo "   'mcp_internal_user_id' => 1,"
 echo ""
-echo "4) Gemini Custom Apps URLs (replace mcp.yourdomain.com with your domain):"
-echo "   - Etalib Web:      https://mcp.yourdomain.com/${SECRET_ETALIB_VAL}/mcp"
-echo "   - GitHub Personal: https://mcp.yourdomain.com/${SECRET_GITHUB_VAL}/mcp"
+echo "4) Gemini Custom Apps URLs (replace mcp.example.com with your domain):"
+echo "   - Personal Notes Web: https://mcp.example.com/${SECRET_NOTES_VAL}/mcp"
+echo "   - GitHub Personal:    https://mcp.example.com/${SECRET_GITHUB_VAL}/mcp"
 echo ""
 if command -v caddy >/dev/null 2>&1; then
     echo "5) Detected Caddy — ready-to-use Caddyfile snippet:"
     echo "----------------------------------------------------------------------"
-    sed -e "s|<SECRET_PATH_ETALIB>|${SECRET_ETALIB_VAL}|g" \
+    sed -e "s|<SECRET_PATH_NOTES>|${SECRET_NOTES_VAL}|g" \
         -e "s|<SECRET_PATH_GITHUB>|${SECRET_GITHUB_VAL}|g" \
         "${INSTALL_DIR}/deploy/caddy/Caddyfile.example"
 elif command -v nginx >/dev/null 2>&1; then
     echo "5) Detected Nginx — ready-to-use server block:"
     echo "----------------------------------------------------------------------"
-    sed -e "s|<SECRET_PATH_ETALIB>|${SECRET_ETALIB_VAL}|g" \
+    sed -e "s|<SECRET_PATH_NOTES>|${SECRET_NOTES_VAL}|g" \
         -e "s|<SECRET_PATH_GITHUB>|${SECRET_GITHUB_VAL}|g" \
-        "${INSTALL_DIR}/deploy/nginx/mcp.yourdomain.com.conf"
+        "${INSTALL_DIR}/deploy/nginx/mcp.example.com.conf"
 else
     echo "5) Reverse proxy templates are located under ${INSTALL_DIR}/deploy/{nginx,caddy}/"
 fi

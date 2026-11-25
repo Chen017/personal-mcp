@@ -1,38 +1,121 @@
-# Personal Dual FastMCP Servers (`Etalib Notes Web` + `GitHub Personal`)
+<h1 align="center">Personal MCP Suite</h1>
 
-个人自建双 MCP 服务（基于 **FastMCP 4 + Stateless Streamable HTTP + BM25SearchTransform**），面向 Debian Linux 服务器与 Google Gemini Custom Connected Apps（Web / iOS）。
+<p align="center">
+  Self-hosted dual <strong>FastMCP</strong> servers (Personal Notes + Firecrawl Web + GitHub) with <strong>BM25 tool folding</strong> and <strong>Stateless Streamable HTTP</strong>, built for Google Gemini Custom Apps and standard MCP clients.
+</p>
 
-## 一键部署（Debian）
+<p align="center">
+  <a href="README.md">English</a> · <a href="README_zh_CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Chen017/personal-mcp/actions/workflows/ci.yml"><img src="https://github.com/Chen017/personal-mcp/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/Python-%3E%3D3.11-3776ab.svg" alt="Python >= 3.11">
+  <img src="https://img.shields.io/badge/FastMCP-4.x-10b981.svg" alt="FastMCP 4.x">
+</p>
+
+---
+
+## ✨ Why This Exists
+
+Connecting personal tools to cloud AI clients (such as Gemini Web & iOS Custom Apps) often runs into three practical bottlenecks:
+
+1. **OAuth refresh drops on mobile & session expiry**: Stateful HTTP sessions and consumer OAuth connectors frequently lose sessions after idle periods or service restarts.
+2. **Router isolation & tool bloat**: Exposing 30–40+ tools across multiple connectors bloats context schemas and lowers selection accuracy, while splitting closely related knowledge/web tools prevents fallback scraping inside the same conversation.
+3. **Unbounded page dumps & unsafe write delegation**: Raw web scrapes or large files blow up context windows, while hiding mutating tools behind a generic proxy strips `destructiveHint=True` confirmation prompts.
+
+This repository solves those with two isolated, stateless FastMCP servers behind capability URLs and reverse-proxy log redaction.
+
+---
+
+## 🏗️ Architecture
+
+```text
+                Gemini (Web / iOS) or any Streamable HTTP MCP Client
+                                        │
+                        HTTPS POST (Stateless JSON-RPC 2.0)
+                                        ▼
+                      Reverse Proxy (Nginx / Caddy + TLS)
+                  ├── /<SECRET_PATH_NOTES>/mcp  ──► 127.0.0.1:8101/mcp (access_log off)
+                  └── /<SECRET_PATH_GITHUB>/mcp ──► 127.0.0.1:8102/mcp (access_log off)
+                                        │
+          ┌─────────────────────────────┴─────────────────────────────┐
+          ▼                                                           ▼
+┌───────────────────────────────────────┐   ┌───────────────────────────────────────┐
+│ Server 1: Personal Notes Web (:8101)  │   │ Server 2: GitHub Personal (:8102)     │
+│ systemd: mcp-notes-web.service        │   │ systemd: mcp-github.service           │
+│                                       │   │                                       │
+│ • 16 backend tools -> 7 exposed       │   │ • 23 backend tools -> 12 exposed      │
+│ • SiYuan Notes RPC client (5 tools)   │   │ • Shared httpx -> GitHub REST API     │
+│ • Firecrawl v2 wrapper (11 tools)     │   │ • Fine-Grained PAT + owner allowlist  │
+│ • Local LRU+TTL cache + offset paging │   │ • ALL 6 write tools pinned directly   │
+│ • BM25SearchTransform (Markdown)      │   │ • BM25SearchTransform (Markdown)      │
+└───────────────────────────────────────┘   └───────────────────────────────────────┘
+          │
+          ▼ (Localhost only, header stripped on public proxy)
+┌───────────────────────────────────────┐
+│ Optional: SiYuan Share Backend (:8081)│
+└───────────────────────────────────────┘
+```
+
+### Tool Inventory & Exposure Policy
+
+| Server | Port | Exposed (`list_tools`) | Backend Total | Pinned Tools (`always_visible`) | BM25 Hidden Tools (`search_tools` + `call_tool`) |
+| :--- | :---: | :---: | :---: | :--- | :--- |
+| **Personal Notes Web** (`servers.notes_web`) | `127.0.0.1:8101` | **7** | **16** | `notes_search_notes`, `notes_read_document`, `notes_list_shares`, `web_scrape`, `web_map` | `notes_get_share_tree`, `notes_get_document_outline`, `web_crawl`, `web_crawl_status`, `web_batch_scrape`, `web_extract_structured`, `web_scrape_pdf`, `web_interact_start`, `web_interact_action`, `web_interact_stop`, `web_check_credit_usage` |
+| **GitHub Personal** (`servers.github_personal`) | `127.0.0.1:8102` | **12** | **23** | **4 Read**: `gh_list_repos`, `gh_get_repo_tree`, `gh_get_file_contents`, `gh_search_code`<br>**6 Write (`destructiveHint=True`)**: `gh_create_or_update_file`, `gh_create_pull_request`, `gh_create_branch`, `gh_push_multiple_files`, `gh_create_issue`, `gh_comment_issue_or_pr` | **13 Read / Download**: `gh_get_repo_info`, `gh_list_branches`, `gh_list_commits`, `gh_get_commit_diff`, `gh_compare_commits`, `gh_list_issues`, `gh_get_issue`, `gh_list_pull_requests`, `gh_get_pull_request_detail`, `gh_list_releases`, `gh_list_workflow_runs`, `gh_get_archive_download_url`, `gh_fetch_directory_bundle` |
+
+---
+
+## 🛡️ Key Engineering Safeguards
+
+- **Stateless Streamable HTTP (`stateless_http=True`)**: Every JSON-RPC call is self-contained with zero in-memory session affinity, preventing `404 Session terminated` errors across mobile reconnects or `systemd` restarts.
+- **Write Safety Preserved**: All 6 GitHub mutating tools are pinned in `always_visible` with `destructiveHint=True` (never hidden behind `call_tool`) and enforced server-side by `GITHUB_ALLOWED_WRITE_OWNERS` (fail-closed if unconfigured).
+- **Zero-Credit Local Cache Pagination**: `web_scrape` and `web_scrape_pdf` cache full extracted Markdown in an LRU + TTL memory store (`WEB_CACHE_TTL_SECONDS=1800`). Follow-up `offset` reads and `find_keyword` jumps consume **0 extra Firecrawl credits**, while each read is capped at `MAX_SINGLE_READ_CHARS` (default `32000`).
+- **Soft Guardrails Without Dead-Ends**: `web_crawl`, `web_batch_scrape`, and `web_extract_structured` pause and return `needs_confirmation=True` above configurable thresholds unless `confirm_large=True` is passed. `firecrawl_search` is intentionally omitted.
+- **Privacy & Log Redaction**: Capability URLs use 64-hex random paths paired with `access_log off` (Nginx) / `log_skip` (Caddy) and `proxy_buffering off`.
+
+---
+
+## 🚀 Quick Start (Debian / Ubuntu)
+
+### 1. One-Command Install & Update
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Chen017/personal-mcp/main/deploy/deploy.sh | bash
 ```
 
-部署脚本默认将项目安装到 `/opt/personal-mcp`，并自动完成：
-1. 检查并安装 `git` / `curl` / `openssl` 与 `uv`，执行 `uv sync`；
-2. 首次部署时从 `.env.example` 生成 `.env`（`chmod 600`），自动生成 64 位随机 `ETALIB_NOTES_INTERNAL_TOKEN`、`SECRET_PATH_ETALIB`、`SECRET_PATH_GITHUB`，并引导填写 `FIRECRAWL_API_KEY` 与 `GITHUB_PAT`；
-3. 安装并启动 `mcp-etalib-web.service`（`:8101`）与 `mcp-github.service`（`:8102`）；
-4. 对本地 `127.0.0.1:8101/mcp` 与 `127.0.0.1:8102/mcp` 执行无状态 JSON-RPC `tools/list` 健康检查；
-5. 自动输出 Nginx / Caddy 反代配置（含 `access_log off` / `log_skip` 与 `proxy_buffering off`）、Gemini Custom Apps URL 以及思源分享 `php-site/config.php` 配置片段。
+The idempotent script installs `uv`, syncs Python dependencies into `/opt/personal-mcp`, creates `.env` (`chmod 600`) with generated random secrets on first run, installs and starts `mcp-notes-web.service` and `mcp-github.service`, verifies HTTP `200` on `127.0.0.1:8101/mcp` and `127.0.0.1:8102/mcp`, and prints ready-to-use Nginx/Caddy snippets. Re-run `bash /opt/personal-mcp/deploy/deploy.sh` anytime to pull updates without overwriting `.env`.
 
-后续拉取最新代码并重启服务，直接重跑同一条命令（或本机执行 `bash /opt/personal-mcp/deploy/deploy.sh`）即可，已有 `.env` 不会被覆盖。
+### 2. Configure Secrets & Reverse Proxy
 
----
-
-## 架构概览
-
-| 服务 | 端口 | `systemd` 单元 | 暴露工具数 | 后端总工具数 | 能力说明 |
-| :--- | :---: | :--- | :---: | :---: | :--- |
-| **Etalib Notes Web** | `127.0.0.1:8101/mcp` | `mcp-etalib-web.service` | 7 | 16 | 思源分享笔记内网客户端（5 工具）+ Firecrawl v2 全功能封装（11 工具，禁用 `firecrawl_search`；支持本地内存缓存 `offset` 续读、`find_keyword` 跳转及 `confirm_large=True` 软上限） |
-| **GitHub Personal** | `127.0.0.1:8102/mcp` | `mcp-github.service` | 12 | 23 | 4 置顶只读 + 6 置顶写工具（`destructiveHint=True`）+ 13 BM25 隐藏只读/下载工具 |
+1. Edit `/opt/personal-mcp/.env` (see [.env.example](.env.example)):
+   - Set `GITHUB_PAT`, `GITHUB_DEFAULT_OWNER`, and `GITHUB_ALLOWED_WRITE_OWNERS`.
+   - Set `FIRECRAWL_API_KEY`.
+   - Optionally set `NOTES_RPC_URL`, `NOTES_INTERNAL_TOKEN`, `NOTES_SITE_DOMAIN`, and `BLOG_SITE_DOMAIN` if integrating a SiYuan Share instance.
+2. Restart services:
+   ```bash
+   sudo systemctl restart mcp-notes-web mcp-github
+   ```
+3. Configure HTTPS reverse proxy using [deploy/nginx/mcp.example.com.conf](deploy/nginx/mcp.example.com.conf) or [deploy/caddy/Caddyfile.example](deploy/caddy/Caddyfile.example).
+4. Follow the step-by-step client guide in [docs/GEMINI_SETUP.md](docs/GEMINI_SETUP.md) to register both Custom Apps, sync schemas in Developer Mode, and apply the Saved Info routing cards.
 
 ---
 
-## 本地开发与测试
+## 🧪 Local Development & CI
 
 ```bash
 uv sync
+uv run ruff check .
+uv run ruff format --check .
 uv run pytest -v
 ```
 
-完整背景设计、Nginx/Caddy 配置要点以及 Gemini **4 张指令卡片**与端到端验收清单见 [plan.md](plan.md)。
+GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs Ruff lint/format checks, Python bytecode compilation, shell syntax validation (`bash -n deploy/deploy.sh`), hygiene/privacy guards, and the full pytest suite across Python `3.11` and `3.12`. See [docs/MAINTENANCE.md](docs/MAINTENANCE.md) for architecture details and troubleshooting.
+
+---
+
+## 📄 License
+
+[MIT](LICENSE)

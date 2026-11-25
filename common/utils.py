@@ -32,10 +32,7 @@ def truncate_text(text: str, max_chars: int = 16000, hint: str = "") -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     extra = f" {hint}" if hint else ""
-    return (
-        f"{text[:max_chars]}\n\n"
-        f"[TRUNCATED: showing {max_chars:,} of {len(text):,} chars.{extra}]"
-    )
+    return f"{text[:max_chars]}\n\n[TRUNCATED: showing {max_chars:,} of {len(text):,} chars.{extra}]"
 
 
 def slice_lines(

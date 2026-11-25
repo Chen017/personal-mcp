@@ -34,12 +34,22 @@ PINNED_TOOLS = [
 
 
 def _default_owner() -> str:
-    return os.getenv("GITHUB_DEFAULT_OWNER", "Chen017").strip() or "Chen017"
+    val = os.getenv("GITHUB_DEFAULT_OWNER", "").strip()
+    if val in {"your-github-username", "your_username"}:
+        return ""
+    return val
 
 
 def _allowed_write_owners() -> set[str]:
-    raw = os.getenv("GITHUB_ALLOWED_WRITE_OWNERS", _default_owner())
-    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+    raw = os.getenv("GITHUB_ALLOWED_WRITE_OWNERS", "").strip()
+    if raw:
+        return {
+            x.strip().lower()
+            for x in raw.split(",")
+            if x.strip() and x.strip() not in {"your-github-username", "your_username"}
+        }
+    default_owner = _default_owner()
+    return {default_owner.lower()} if default_owner else set()
 
 
 def _default_file_lines() -> int:
@@ -50,8 +60,10 @@ def _default_diff_chars() -> int:
     return int(os.getenv("DEFAULT_DIFF_CHARS", "15000"))
 
 
-SERVER_INSTRUCTIONS = f"""
-Personal GitHub & code repository MCP server for {_default_owner()} (个人代码仓库 / 我的仓库 / GitHub 仓库 / 项目与主题源码管理工具，默认账号: {_default_owner()}):
+def _build_server_instructions() -> str:
+    owner_label = _default_owner() or "the configured account"
+    return f"""
+Personal GitHub & code repository MCP server for {owner_label} (个人代码仓库 / 我的仓库 / GitHub 仓库 / 项目与主题源码管理工具):
 Directly list personal repositories (public & private), inspect repository directory trees and source code files, search code, view commits/diffs/issues/PRs/releases/Actions, download repository archives, edit files, create branches, and submit Pull Requests (支持查看我的仓库、项目文件目录、主题源码、README、分支、提交记录、Issue、PR、Actions、下载代码、修改文件与提 PR).
 
 Ask for explicit user confirmation before calling write/mutating tools (all 6 write tools are directly exposed with destructiveHint=True).
@@ -59,6 +71,9 @@ For hidden read-only & download tools, always pass ENGLISH keywords to `search_t
 - Repository inspection: repo metadata/stars/permissions (`gh_get_repo_info`), branches (`gh_list_branches`), commit history (`gh_list_commits`), commit diff (`gh_get_commit_diff`), compare refs (`gh_compare_commits`), issues (`gh_list_issues`, `gh_get_issue`), pull requests (`gh_list_pull_requests`, `gh_get_pull_request_detail`), releases (`gh_list_releases`), GitHub Actions workflows & runs (`gh_list_workflow_runs`).
 - Code download & batch reading: generate zip/tarball download URL (`gh_get_archive_download_url`), fetch multiple files in a directory bundle (`gh_fetch_directory_bundle`).
 """.strip()
+
+
+SERVER_INSTRUCTIONS = _build_server_instructions()
 
 mcp = FastMCP(
     name="GitHub Personal",
@@ -112,11 +127,13 @@ def _get_gh_client() -> tuple[httpx.AsyncClient | None, str | None]:
 
 def _check_write_allowed(owner: str) -> str | None:
     allowed = _allowed_write_owners()
-    if allowed and owner.lower() not in allowed:
+    if not allowed:
         return (
-            f"Write blocked: owner '{owner}' is not in GITHUB_ALLOWED_WRITE_OWNERS "
-            f"({sorted(allowed)})."
+            "Write blocked: configure GITHUB_ALLOWED_WRITE_OWNERS (or GITHUB_DEFAULT_OWNER) "
+            "in .env before performing mutating operations."
         )
+    if owner.lower() not in allowed:
+        return f"Write blocked: owner '{owner}' is not in GITHUB_ALLOWED_WRITE_OWNERS ({sorted(allowed)})."
     return None
 
 
@@ -151,13 +168,19 @@ async def gh_list_repos(
     visibility: Literal["all", "public", "private"] = "all",
     limit: int = 30,
 ) -> dict:
-    """List personal repositories (owned public & private repos of Chen017) or any public GitHub user/org repositories (列出我的个人仓库、代码项目、主题仓库等，含私有仓库).
-    Keywords: github list repos repositories projects private public Chen017.
+    """List personal repositories (owned public & private repos of the configured account) or any public GitHub user/org repositories (列出我的个人仓库、代码项目、主题仓库等，含私有仓库).
+    Keywords: github list repos repositories projects private public personal.
     """
-    target_owner = owner.strip() or _default_owner()
+    default_owner = _default_owner()
+    target_owner = owner.strip() or default_owner
+    if not target_owner:
+        return {
+            "isError": True,
+            "error": "Provide an explicit owner or configure GITHUB_DEFAULT_OWNER in .env.",
+        }
     try:
         per_page = max(1, min(limit, 100))
-        if target_owner.lower() == _default_owner().lower():
+        if default_owner and target_owner.lower() == default_owner.lower():
             data = await _gh_request(
                 "GET",
                 "/user/repos",
@@ -258,8 +281,7 @@ async def gh_get_file_contents(
                 "type": "directory",
                 "path": clean_path,
                 "entries": [
-                    {"name": e["name"], "path": e["path"], "type": e["type"], "size": e.get("size", 0)}
-                    for e in data
+                    {"name": e["name"], "path": e["path"], "type": e["type"], "size": e.get("size", 0)} for e in data
                 ],
             }
         if data.get("encoding") == "base64" and data.get("content"):
@@ -332,7 +354,9 @@ async def gh_create_or_update_file(
     try:
         if not sha:
             try:
-                existing = await _gh_request("GET", f"/repos/{owner}/{repo}/contents/{clean_path}", params={"ref": branch})
+                existing = await _gh_request(
+                    "GET", f"/repos/{owner}/{repo}/contents/{clean_path}", params={"ref": branch}
+                )
                 if isinstance(existing, dict):
                     sha = existing.get("sha", "")
             except httpx.HTTPStatusError as exc:
@@ -427,7 +451,7 @@ async def gh_push_multiple_files(
         base_tree_sha = commit_data["tree"]["sha"]
 
         tree_entries = []
-        for raw_path, content in zip(file_paths, file_contents):
+        for raw_path, content in zip(file_paths, file_contents, strict=True):
             clean_path = raw_path.lstrip("/")
             blob = await _gh_request(
                 "POST",
@@ -912,7 +936,7 @@ async def gh_get_archive_download_url(
             "curl_cmd": (
                 f'curl -L -H "Authorization: Bearer $GITHUB_PAT" '
                 f'"https://api.github.com/repos/{owner}/{repo}/{archive_format}/{target_ref}" '
-                f'-o {repo}-{target_ref}.{ext}'
+                f"-o {repo}-{target_ref}.{ext}"
             ),
             "note": (
                 "For private repos, direct_download_url is a short-lived signed link from GitHub; "
