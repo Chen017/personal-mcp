@@ -20,17 +20,17 @@ from common.utils import format_http_error, truncate_text
 load_dotenv()
 
 SERVER_INSTRUCTIONS = """
-Personal notes and web-reading MCP hub combining:
-1. Etalib Notes (note.etalib.space): read-only access to personal SiYuan shared notes. ONLY invoke notes_* tools when the user explicitly provides a note.etalib.space/etalib.space URL OR explicitly asks to check/search their personal notes; for general knowledge or conceptual questions without explicit mention of notes, answer directly using general knowledge without calling notes_* tools.
-2. Firecrawl Web Tools: fallback web scraping/crawling for inaccessible URLs (including www.etalib.space, JS-rendered pages, remote PDFs, and GOOGLE_EXTENDED_OPT_OUT sites).
-   - `web_scrape` and `web_scrape_pdf` cache full extracted Markdown locally in memory (TTL ~30 min) and support `offset` pagination + `find_keyword` jumping at ZERO extra Firecrawl credits.
-   - Multi-page tools (`web_crawl`, `web_batch_scrape`, `web_extract_structured`) enforce soft confirmation limits to prevent accidental credit burn; if a call returns `needs_confirmation=True`, ask the user and retry with `confirm_large=True` (or use `web_map` + `web_scrape`).
+Primary MCP server for the user's personal notes (Etalib Notes on note.etalib.space) and full-featured web/blog/PDF reader (Firecrawl v2):
+1. Personal Notes & Coursework (note.etalib.space / SiYuan Notes / 我的笔记、思源笔记、课程笔记):
+   Use this server whenever the user says "check my notes", "my notes", "search my notes", "course notes", "lectures", or shares a note.etalib.space link. This is the user's real notes repository (distinct from Google Keep or Google Drive). Supports listing notebooks (`notes_list_shares`), searching notes (`notes_search_notes`), reading clean Markdown with LaTeX (`notes_read_document`), browsing course trees (`notes_get_share_tree`), and inspecting document outlines (`notes_get_document_outline`).
+2. Webpage, Blog & Remote PDF Reader (www.etalib.space, etalib.space, and any external website / 抓取网页、博客文章、解析远程PDF):
+   Directly fetch, read, map, crawl, extract structured JSON, parse remote PDFs, and interact with webpages — including www.etalib.space, etalib.space, JS-rendered sites, documentation sites, and external PDFs.
+   - `web_scrape` and `web_scrape_pdf` cache full Markdown locally in memory (TTL ~30 min) and support `offset` pagination + `find_keyword` jumping at zero extra Firecrawl credits.
+   - Multi-page tools (`web_crawl`, `web_batch_scrape`, `web_extract_structured`) use soft confirmation thresholds (`confirm_large=True` to proceed on large batches).
 
-IMPORTANT for hidden tools: always pass ENGLISH keywords to `search_tools`, then invoke with `call_tool`.
-Hidden tools available via `search_tools` + `call_tool`:
-- Notes: browse share folder hierarchy tree (`notes_get_share_tree`), inspect document headings/TOC and offsets (`notes_get_document_outline`).
-- Web/Firecrawl: multi-page crawl (`web_crawl`, `web_crawl_status`), batch URL scraping (`web_batch_scrape`), structured JSON extraction (`web_extract_structured`), remote PDF parsing (`web_scrape_pdf`), browser interactive click/form sessions (`web_interact_start`, `web_interact_action`, `web_interact_stop` - always stop after use), and credit usage check (`web_check_credit_usage`).
-Do NOT use web tools as a general search engine; use them only for explicit URLs or when built-in browsing fails.
+For hidden tools, always pass ENGLISH keywords to `search_tools`, then invoke via `call_tool`:
+- Notes: browse notebook folder hierarchy tree (`notes_get_share_tree`), inspect document headings/TOC and offsets (`notes_get_document_outline`).
+- Web/Firecrawl: multi-page crawl (`web_crawl`, `web_crawl_status`), batch URL scraping (`web_batch_scrape`), structured JSON extraction (`web_extract_structured`), remote PDF parsing (`web_scrape_pdf`), browser interactive click/form sessions (`web_interact_start`, `web_interact_action`, `web_interact_stop` - stop after finishing), and credit usage check (`web_check_credit_usage`).
 """.strip()
 
 PINNED_TOOLS = [
@@ -48,7 +48,7 @@ READ_ONLY_ANNOTATIONS = {
 }
 
 mcp = FastMCP(
-    name="Etalib Web",
+    name="Etalib Notes Web",
     instructions=SERVER_INSTRUCTIONS,
     transforms=[
         BM25SearchTransform(
@@ -371,10 +371,10 @@ def _extract_scrape_id(scrape_resp: dict) -> str:
 # ==================== 1. SiYuan Notes 工具（5 个：3 置顶 + 2 隐藏） ====================
 
 
-@mcp.tool(annotations={"title": "List Shared Note Notebooks", **READ_ONLY_ANNOTATIONS})
+@mcp.tool(annotations={"title": "List Personal Note Notebooks", **READ_ONLY_ANNOTATIONS})
 async def notes_list_shares(cursor: str = "") -> dict:
-    """List all public SiYuan shared notebooks and top-level course nodes.
-    Keywords: siyuan notes list shares notebooks courses catalog index.
+    """List all of the user's personal SiYuan shared notebooks and top-level course nodes on note.etalib.space (use when the user asks to check my notes / 列出我的思源笔记库和课程).
+    Keywords: siyuan notes list shares notebooks courses catalog index check my notes.
     """
     args = {"cursor": cursor} if cursor else {}
     return await _call_siyuan_notes("list_shares", args)
@@ -387,8 +387,8 @@ async def notes_search_notes(
     parent_doc_id: str = "",
     limit: int = 20,
 ) -> dict:
-    """Search public SiYuan notes by space-separated keywords across all notebooks or inside a specific share/subtree.
-    Keywords: siyuan notes search find theorem definition lecture query.
+    """Search the user's personal SiYuan notes on note.etalib.space by keywords across all notebooks or a course subtree (use for "check my notes", "search my notes", theorems, definitions, lectures / 检索我的笔记和课程讲义).
+    Keywords: siyuan notes search find theorem definition lecture query check my notes.
     """
     args: dict = {"query": query, "limit": max(1, min(limit, 50))}
     if share:
@@ -398,15 +398,15 @@ async def notes_search_notes(
     return await _call_siyuan_notes("search_notes", args)
 
 
-@mcp.tool(annotations={"title": "Read Note Document", **READ_ONLY_ANNOTATIONS})
+@mcp.tool(annotations={"title": "Read Personal Note Document", **READ_ONLY_ANNOTATIONS})
 async def notes_read_document(
     share: str,
     doc_id: str = "",
     offset: int = 0,
     max_chars: int | None = None,
 ) -> dict:
-    """Read clean Markdown of a SiYuan shared note (with LaTeX preserved). Supports chunked reading via offset and max_chars.
-    Keywords: siyuan notes read document content markdown latex offset.
+    """Read clean Markdown of a personal SiYuan note on note.etalib.space with LaTeX preserved and offset pagination (读取我的思源笔记正文，支持 note.etalib.space 链接).
+    Keywords: siyuan notes read document content markdown latex offset check my notes.
     """
     effective_max = max_chars if max_chars is not None else _default_note_chars()
     clamped = max(1000, min(effective_max, 50000))
@@ -455,8 +455,7 @@ async def web_scrape(
     wait_for_ms: int = 0,
     refresh: bool = False,
 ) -> dict:
-    """Scrape a webpage into clean Markdown and cache it locally for zero-cost `offset` pagination and `find_keyword` jumping.
-    Use when built-in browsing fails or hits GOOGLE_EXTENDED_OPT_OUT.
+    """Fetch and read any webpage, blog post, or article (including www.etalib.space, etalib.space, JS-rendered sites, and any external URL) into clean Markdown, cached locally for zero-credit `offset` pagination and `find_keyword` jumping (抓取并读取任意网页、个人博客或文章正文，支持缓存续读).
     Keywords: firecrawl scrape webpage url read article markdown js render opt_out etalib blog offset cache.
     """
     variant = f"main={only_main_content}"
@@ -486,7 +485,7 @@ async def web_scrape(
 
 @mcp.tool(annotations={"title": "Map Website Sub-links (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
 async def web_map(url: str, search: str = "", limit: int = 50) -> dict:
-    """Discover and enumerate sub-page URLs under a website before selectively scraping target pages.
+    """Discover and enumerate sub-page URLs under any website (including www.etalib.space or external docs/blogs) before selectively scraping target pages (扫描并列出网站子页面和文章链接列表).
     Keywords: firecrawl map sitemap links directory subpages discover urls.
     """
     payload: dict[str, Any] = {"url": url, "limit": max(1, limit)}

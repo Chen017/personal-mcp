@@ -57,6 +57,13 @@ def _parse_tool_payload(result: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
+    assert etalib_web.mcp.name == "Etalib Notes Web"
+    for forbidden_phrase in ("ONLY invoke", "Do NOT use", "when built-in browsing fails", "fallback web scraping"):
+        assert forbidden_phrase not in etalib_web.SERVER_INSTRUCTIONS
+    assert "check my notes" in etalib_web.SERVER_INSTRUCTIONS
+    assert "www.etalib.space" in etalib_web.SERVER_INSTRUCTIONS
+    assert "我的仓库" in github_personal.SERVER_INSTRUCTIONS
+
     async with Client(etalib_web.mcp) as c1:
         tools1 = await c1.list_tools()
     names1 = [t.name for t in tools1]

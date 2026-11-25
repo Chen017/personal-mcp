@@ -1,4 +1,4 @@
-# Personal Dual FastMCP Servers (`Etalib Web` + `GitHub Personal`)
+# Personal Dual FastMCP Servers (`Etalib Notes Web` + `GitHub Personal`)
 
 个人自建双 MCP 服务（基于 **FastMCP 4 + Stateless Streamable HTTP + BM25SearchTransform**），面向 Debian Linux 服务器与 Google Gemini Custom Connected Apps（Web / iOS）。
 
@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/Chen017/personal-mcp/main/deploy/de
 
 | 服务 | 端口 | `systemd` 单元 | 暴露工具数 | 后端总工具数 | 能力说明 |
 | :--- | :---: | :--- | :---: | :---: | :--- |
-| **Etalib Web** | `127.0.0.1:8101/mcp` | `mcp-etalib-web.service` | 7 | 16 | 思源分享笔记内网客户端（5 工具）+ Firecrawl v2 全功能封装（11 工具，禁用 `firecrawl_search`；支持本地内存缓存 `offset` 续读、`find_keyword` 跳转及 `confirm_large=True` 软上限） |
+| **Etalib Notes Web** | `127.0.0.1:8101/mcp` | `mcp-etalib-web.service` | 7 | 16 | 思源分享笔记内网客户端（5 工具）+ Firecrawl v2 全功能封装（11 工具，禁用 `firecrawl_search`；支持本地内存缓存 `offset` 续读、`find_keyword` 跳转及 `confirm_large=True` 软上限） |
 | **GitHub Personal** | `127.0.0.1:8102/mcp` | `mcp-github.service` | 12 | 23 | 4 置顶只读 + 6 置顶写工具（`destructiveHint=True`）+ 13 BM25 隐藏只读/下载工具 |
 
 ---

@@ -51,12 +51,11 @@ def _default_diff_chars() -> int:
 
 
 SERVER_INSTRUCTIONS = f"""
-Personal GitHub MCP server (default account: {_default_owner()}) supporting full repository reading, code inspection, code downloading, editing files, branch management, and creating Pull Requests.
+Personal GitHub & code repository MCP server for {_default_owner()} (个人代码仓库 / 我的仓库 / GitHub 仓库 / 项目与主题源码管理工具，默认账号: {_default_owner()}):
+Directly list personal repositories (public & private), inspect repository directory trees and source code files, search code, view commits/diffs/issues/PRs/releases/Actions, download repository archives, edit files, create branches, and submit Pull Requests (支持查看我的仓库、项目文件目录、主题源码、README、分支、提交记录、Issue、PR、Actions、下载代码、修改文件与提 PR).
 
-Always ask for explicit user confirmation before calling any write/mutating tool (all 6 write tools are directly exposed with destructiveHint=True).
-IMPORTANT for hidden tools: always pass ENGLISH keywords to `search_tools`, then invoke with `call_tool`.
-
-Hidden read-only & download tools available via `search_tools` + `call_tool`:
+Ask for explicit user confirmation before calling write/mutating tools (all 6 write tools are directly exposed with destructiveHint=True).
+For hidden read-only & download tools, always pass ENGLISH keywords to `search_tools`, then invoke via `call_tool`:
 - Repository inspection: repo metadata/stars/permissions (`gh_get_repo_info`), branches (`gh_list_branches`), commit history (`gh_list_commits`), commit diff (`gh_get_commit_diff`), compare refs (`gh_compare_commits`), issues (`gh_list_issues`, `gh_get_issue`), pull requests (`gh_list_pull_requests`, `gh_get_pull_request_detail`), releases (`gh_list_releases`), GitHub Actions workflows & runs (`gh_list_workflow_runs`).
 - Code download & batch reading: generate zip/tarball download URL (`gh_get_archive_download_url`), fetch multiple files in a directory bundle (`gh_fetch_directory_bundle`).
 """.strip()
@@ -152,7 +151,7 @@ async def gh_list_repos(
     visibility: Literal["all", "public", "private"] = "all",
     limit: int = 30,
 ) -> dict:
-    """List repositories for the authenticated user (owned repos including private) or any public GitHub user/org.
+    """List personal repositories (owned public & private repos of Chen017) or any public GitHub user/org repositories (列出我的个人仓库、代码项目、主题仓库等，含私有仓库).
     Keywords: github list repos repositories projects private public Chen017.
     """
     target_owner = owner.strip() or _default_owner()
@@ -209,7 +208,7 @@ async def gh_get_repo_tree(
     path_prefix: str = "",
     max_entries: int = 200,
 ) -> dict:
-    """List files and directory structure of a GitHub repository, automatically ignoring .git, node_modules, dist, and lockfiles.
+    """List files and directory structure of a code repository (查看我的仓库或任意 GitHub 仓库的目录结构和文件列表), automatically ignoring .git, node_modules, dist, and lockfiles.
     Keywords: github directory tree files structure browse folder list.
     """
     try:
@@ -247,7 +246,7 @@ async def gh_get_file_contents(
     start_line: int = 1,
     end_line: int | None = None,
 ) -> dict:
-    """Read a source code file or README (or list a directory if path points to a folder) with line-range slicing.
+    """Read a source code file or README (or list a directory) in a personal or public code repository with line-range slicing (读取仓库源码、配置文件或 README 内容).
     Keywords: github read file code source readme view cat content.
     """
     try:
@@ -296,7 +295,7 @@ async def gh_get_file_contents(
 
 @mcp.tool(annotations={"title": "Search GitHub Code", **READ_ANNOTATIONS})
 async def gh_search_code(query: str, repo: str = "", limit: int = 15) -> dict:
-    """Search code across GitHub or within a specific repository (pass repo as 'owner/name').
+    """Search source code across personal or public GitHub repositories (在我的代码仓库或指定仓库中搜索源码、函数和关键词; pass repo as 'owner/name').
     Keywords: github search code grep symbol function find.
     """
     try:

@@ -1167,22 +1167,23 @@ header_up -X-MCP-Internal-Token
 1. 电脑浏览器访问 `https://gemini.google.com` → `Settings` → `Connected Apps` → `Custom apps`：
    * **删除旧的 3 个自定义连接器**（旧 `@Etalib Notes`、旧 `@Firecrawl Fastmcp`、旧 `@GitHub MCP Server`）。
    * **新增 App 1**：
-     * Name: **`Etalib Web`**
+     * Name: **`Etalib Notes Web`**
      * MCP Server URL: `https://mcp.yourdomain.com/<SECRET_PATH_ETALIB>/mcp`
      * Auth: **No authentication**
    * **新增 App 2**：
      * Name: **`GitHub Personal`**
      * MCP Server URL: `https://mcp.yourdomain.com/<SECRET_PATH_GITHUB>/mcp`
      * Auth: **No authentication**
-2. **用官方开发者模式核验**：打开 **`https://gemini.google.com/devmode`**，分别选中 `Etalib Web` 与 `GitHub Personal`，点击 `Sync schema`，确认 `Tool Schemas` 正常显示（Server 1 为 7 个工具，Server 2 为 12 个工具且写工具标注完整）且 `Event Log` 无报错。
+   * **防劫持建议**：若不用 Google Keep 记学习笔记，建议在 `Connected Apps` 关闭 Google Keep，避免 `"check my notes"` 被 Google Keep/Drive 抢走。
+2. **用官方开发者模式核验**：打开 **`https://gemini.google.com/devmode`**，分别选中 `Etalib Notes Web` 与 `GitHub Personal`，点击 `Sync schema`，确认 `Tool Schemas` 正常显示（Server 1 为 7 个工具，Server 2 为 12 个工具且写工具标注完整）且 `Event Log` 无报错。
 
 ### 5.2 更新「Instructions for Gemini / 已保存的信息」（删除旧卡片，粘贴以下 4 张英文卡片）
 
-> 已同步适配新命名（`@Etalib Web` / `@GitHub Personal`）及最新需求：**笔记严格仅在用户显式要求或给出链接时查阅、普通问答不查笔记、查到笔记做批判性纠错、引导用英文关键词调 `search_tools`、移除 Firecrawl 页数硬上限限制**。
+> 已同步适配新命名（`@Etalib Notes Web` / `@GitHub Personal`）及最新需求：**笔记严格仅在用户显式要求或给出链接时查阅、明确区分于 Google Keep/Drive、普通问答不查笔记、查到笔记做批判性纠错、引导用英文关键词调 `search_tools`、移除 Firecrawl 页数硬上限限制并支持缓存续读**。
 
-#### Card 1: `@Etalib Web` (Personal Notes — Explicit Trigger Only)
+#### Card 1: `@Etalib Notes Web` (Personal Notes — Explicit Trigger Only)
 ```text
-Only invoke the notes tools inside @Etalib Web (notes_search_notes, notes_read_document, notes_list_shares, or hidden tree/outline tools) when: (1) my message contains a note.etalib.space or etalib.space URL; OR (2) I explicitly ask you to check, look up, or inspect my personal notes (e.g., "去看看笔记", "查一下我的笔记", "我的笔记里有什么", "check my notes"). For all general knowledge, math, physics, or CS questions where I do not explicitly refer to my notes or provide a note URL, answer directly using your general knowledge and reasoning without calling any notes tool. When a needed notes tool (such as folder tree or document outline) is hidden, query search_tools using ENGLISH keywords and invoke it via call_tool. Never use built-in web search for note.etalib.space. When relevant notes are found, cite the note title and URL and align with their notation, but verify accuracy critically: do not blindly copy errors—explicitly flag typos, missing hypotheses, or technical mistakes and provide the corrected, rigorous version.
+"My notes", "check my notes", and "course notes" refer to my SiYuan notes in @Etalib Notes Web (note.etalib.space), NOT Google Keep or Google Drive. Only invoke the notes tools inside @Etalib Notes Web (notes_search_notes, notes_read_document, notes_list_shares, or hidden tree/outline tools) when: (1) my message contains a note.etalib.space or etalib.space URL; OR (2) I explicitly ask you to check, look up, or inspect my personal notes (e.g., "check my notes", "search my notes", "去看看笔记", "我的笔记里有什么"). If I explicitly ask to check my notes and @Etalib Notes Web is not mounted in the current session, do NOT fall back to Google Keep/Drive or fabricate note contents—simply ask me to reply with "@Etalib Notes Web". For all general knowledge, math, physics, or CS questions where I do not explicitly refer to my notes or provide a note URL, answer directly using your general knowledge and reasoning without calling any notes tool. When a needed notes tool (such as folder tree or document outline) is hidden, query search_tools using ENGLISH keywords and invoke it via call_tool. Never use built-in web search for note.etalib.space. When relevant notes are found, cite the note title and URL and align with their notation, but verify accuracy critically: do not blindly copy errors—explicitly flag typos, missing hypotheses, or technical mistakes and provide the corrected, rigorous version.
 ```
 
 #### Card 2: `@GitHub Personal` (GitHub Read, Write, PR & Download)
@@ -1190,23 +1191,23 @@ Only invoke the notes tools inside @Etalib Web (notes_search_notes, notes_read_d
 Always proactively invoke the @GitHub Personal MCP tools—even if I do not explicitly type @GitHub Personal—for any request involving GitHub, including GitHub URLs, repositories, source code, directories, READMEs, commits, branches, issues, pull requests, releases, actions, code downloads, or my personal account Chen017. Prefer @GitHub Personal over built-in web search for all GitHub lookups. If a needed GitHub capability (such as viewing commit diffs, issues/PR details, workflow runs, or downloading repo archives) is hidden, query search_tools using ENGLISH keywords and invoke it via call_tool. If @GitHub Personal is not mounted in the current session, do not fabricate repo details—simply ask me to reply with "@GitHub Personal". Always ask for my explicit confirmation before performing any write or mutating operation (modifying files, creating branches, pushing commits, opening issues, or submitting PRs).
 ```
 
-#### Card 3: General Web Access & `@Etalib Web` (Firecrawl) Fallback
+#### Card 3: General Web Access & `@Etalib Notes Web` (Firecrawl) Fallback
 ```text
-For general web queries and public URLs outside etalib.space and GitHub, start with built-in web search and web reading. If built-in search/reading fails, hits an access restriction (such as GOOGLE_EXTENDED_OPT_OUT), returns incomplete content, or requires crawling sub-links, JS rendering, structured extraction, browser interaction, or remote PDF parsing: (1) if @Etalib Web is available in the current session, immediately use its web/Firecrawl tools (query search_tools using ENGLISH keywords and invoke via call_tool for crawl/batch/extract/PDF/interact tools) instead of saying you cannot access the site; (2) if @Etalib Web is not mounted in the current session, do not ask me to paste the webpage—simply tell me briefly to reply with "@Etalib Web" so it mounts and fetches the page. When web_scrape or web_scrape_pdf returns truncated=True, continue reading via offset=next_offset or find_keyword (which reads from local cache at 0 extra Firecrawl credits). Never use web tools as a general search engine; prefer web_map followed by web_scrape for targeted sub-pages; ask confirmation before passing confirm_large=True; and always call web_interact_stop immediately after finishing any interactive browser session.
+For general web queries and public URLs outside etalib.space and GitHub, start with built-in web search and web reading. If built-in search/reading fails, hits an access restriction (such as GOOGLE_EXTENDED_OPT_OUT), returns incomplete content, or requires crawling sub-links, JS rendering, structured extraction, browser interaction, or remote PDF parsing: (1) if @Etalib Notes Web is available in the current session, immediately use its web/Firecrawl tools (query search_tools using ENGLISH keywords and invoke via call_tool for crawl/batch/extract/PDF/interact tools) instead of saying you cannot access the site; (2) if @Etalib Notes Web is not mounted in the current session, do not ask me to paste the webpage—simply tell me briefly to reply with "@Etalib Notes Web" so it mounts and fetches the page. When web_scrape or web_scrape_pdf returns truncated=True, continue reading via offset=next_offset or find_keyword (which reads from local cache at 0 extra Firecrawl credits). Never use web tools as a general search engine; prefer web_map followed by web_scrape for targeted sub-pages; ask confirmation before passing confirm_large=True; and always call web_interact_stop immediately after finishing any interactive browser session.
 ```
 
 #### Card 4: Factual Verification & Citation Discipline
 ```text
-For questions involving public external facts, official regulations, statistics, product specs, time-sensitive events, or community opinions, do not rely solely on internal memory—verify them using actual tool outputs from the current session (built-in web search/reading or @Etalib Web) and cite the real sources. Never fabricate facts, links, or tool outputs. If verification fails or returns no supporting evidence, explicitly state that no verified evidence was found. This web-verification requirement does not apply when answering directly from @Etalib Web course notes (when explicitly requested), @GitHub Personal, or pure logic/math derivation.
+For questions involving public external facts, official regulations, statistics, product specs, time-sensitive events, or community opinions, do not rely solely on internal memory—verify them using actual tool outputs from the current session (built-in web search/reading or @Etalib Notes Web) and cite the real sources. Never fabricate facts, links, or tool outputs. If verification fails or returns no supporting evidence, explicitly state that no verified evidence was found. This web-verification requirement does not apply when answering directly from @Etalib Notes Web course notes (when explicitly requested), @GitHub Personal, or pure logic/math derivation.
 ```
 
 ---
 
 ### 5.3 上线端到端验收清单（在 Gemini Web 与 iOS 实测）
 
-1. **显式查笔记 + 隐藏工具**：新对话提问「去看看我笔记里微分几何这门课的完整目录结构和第一讲大纲」→ 应自动挂载 `@Etalib Web`，并通过英文 `search_tools` 找到 `notes_get_share_tree` 与 `notes_get_document_outline` 完成回答。
-2. **未提及笔记不触发**：新对话提问「请详细推导并解释光滑流形上切空间的定义和基本性质」→ **不应**调用 `@Etalib Web` 查笔记，直接用通用知识回答。
-3. **主站防 `OPT_OUT`**：新对话提问「`www.etalib.space` 最新一篇文章是什么」→ 应自动挂载 `@Etalib Web` 并用 `web_scrape` 读出正文（不再因 `OPT_OUT` 报错）。
-4. **陌生被拦截网页兜底**：新对话丢一个搜不到的动态网站或远程 PDF 让它解析总结 → 若首轮未挂载 `@Etalib Web`，它应简短提示你回复 `@Etalib Web`；你回复后立刻用 `web_scrape` / `web_scrape_pdf`（经 `search_tools`）完成读取。
+1. **显式查笔记 + 隐藏工具**：新对话提问「Check my notes and give me the definition of the group.」→ 应挂载 `@Etalib Notes Web`（不再被 Google Keep/Drive 劫持），搜到对应代数笔记。
+2. **未提及笔记不触发**：新对话提问「请详细推导并解释光滑流形上切空间的定义和基本性质」→ **不应**调用 `@Etalib Notes Web` 查笔记，直接用通用知识回答。
+3. **主站防 `OPT_OUT`**：新对话提问「`www.etalib.space` 最新一篇文章是什么」→ 应自动挂载 `@Etalib Notes Web` 并用 `web_scrape` 读出正文（不再因 `OPT_OUT` 报错）。
+4. **陌生被拦截网页兜底**：新对话丢一个搜不到的动态网站或远程 PDF 让它解析总结 → 若首轮未挂载 `@Etalib Notes Web`，它应简短提示你回复 `@Etalib Notes Web`；你回复后立刻用 `web_scrape` / `web_scrape_pdf`（经 `search_tools`）完成读取。
 5. **GitHub 跨端稳定性 & 隐藏工具**：在 **iOS App** 新对话提问「查看 `Chen017` 最近更新的仓库，并给我下载某个仓库 zip 的链接」→ 因 `stateless_http=True` + PAT 直连，即使隔天仍稳定挂载不掉线，且能通过英文 `search_tools` 找到 `gh_get_archive_download_url`。
 6. **GitHub 写操作原生确认保护**：测试「帮我在 `Chen017/<测试仓库>` 新建一个分支修改 README 并准备提 PR」→ 所有写工具（包括 `gh_create_branch`、`gh_create_or_update_file`、`gh_create_pull_request`）均直接可见并带 `destructiveHint=True`，必须在执行前向你二次确认。
