@@ -148,9 +148,15 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("ETALIB_NOTES_INTERNAL_TOKEN", "internal-secret-token")
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
     monkeypatch.setenv("FIRECRAWL_API_BASE_URL", "https://api.firecrawl.dev/v2")
+    monkeypatch.setenv("MAX_SINGLE_READ_CHARS", "2000")
+    monkeypatch.setenv("CRAWL_SOFT_MAX_PAGES", "20")
+    monkeypatch.setenv("BATCH_SOFT_MAX_URLS", "3")
+    monkeypatch.setenv("EXTRACT_SOFT_MAX_URLS", "2")
 
     recorded_notes: list[dict[str, Any]] = []
     recorded_fc: list[tuple[str, str, Any]] = []
+    full_blog_md = ("BlogIntro " * 120) + "MIDDLE_MARKER " + ("BlogTail " * 200)
+    full_pdf_md = ("Header line\n" * 80) + "Theorem 4.2: Stokes theorem on manifolds.\n" + ("Proof body " * 220)
 
     def notes_handler(request: httpx.Request) -> httpx.Response:
         assert request.headers.get("X-MCP-Internal-Token") == "internal-secret-token"
@@ -201,7 +207,7 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
                     json={
                         "success": True,
                         "data": {
-                            "markdown": "PDF Page 1\n" + ("A" * 500),
+                            "markdown": full_pdf_md,
                             "metadata": {"title": "Lecture.pdf"},
                         },
                     },
@@ -211,7 +217,7 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
                 json={
                     "success": True,
                     "data": {
-                        "markdown": "Article content " + ("X" * 300),
+                        "markdown": full_blog_md,
                         "metadata": {"scrapeId": "scr_123", "title": "Blog"},
                     },
                 },
@@ -224,6 +230,38 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             return httpx.Response(200, json={"success": True, "data": {"remainingCredits": 4500}})
         if request.method == "POST" and request.url.path == "/v2/crawl":
             return httpx.Response(200, json={"success": True, "id": "crawl_999"})
+        if request.method == "GET" and request.url.path == "/v2/crawl/crawl_999":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "data": [
+                        {
+                            "markdown": f"Crawled page {i} content",
+                            "metadata": {"sourceURL": f"https://example.com/p{i}"},
+                        }
+                        for i in range(4)
+                    ],
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v2/batch/scrape":
+            return httpx.Response(200, json={"success": True, "id": "batch_1"})
+        if request.method == "GET" and request.url.path == "/v2/batch/scrape/batch_1":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "data": [
+                        {
+                            "markdown": f"Batch item {i}",
+                            "metadata": {"sourceURL": f"https://example.com/b{i}"},
+                        }
+                        for i in range(4)
+                    ],
+                },
+            )
         if request.method == "POST" and request.url.path == "/v2/extract":
             return httpx.Response(200, json={"success": True, "status": "completed", "data": {"title": "OK"}})
         return httpx.Response(404, json={"error": "not found"})
@@ -243,19 +281,160 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
             )
             assert "smooth manifold" in r_doc["content"]
 
-            r_scrape = _parse_tool_payload(
-                await client.call_tool("web_scrape", {"url": "https://www.etalib.space", "max_chars": 50})
+            # 1) web_scrape: first read hits Firecrawl once; paginated reads hit cache (0 extra hits)
+            chunks: list[str] = []
+            r1 = _parse_tool_payload(
+                await client.call_tool("web_scrape", {"url": "https://www.etalib.space", "max_chars": 1200})
             )
-            assert "[TRUNCATED:" in r_scrape["markdown"]
+            assert r1["cached"] is False
+            assert r1["truncated"] is True
+            assert r1["next_offset"] == 1200
+            chunks.append(r1["markdown"])
 
-            r_pdf = _parse_tool_payload(
+            scrape_calls_after_first = sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape"))
+            assert scrape_calls_after_first == 1
+
+            offset = r1["next_offset"]
+            while offset is not None:
+                rn = _parse_tool_payload(
+                    await client.call_tool(
+                        "web_scrape",
+                        {"url": "https://www.etalib.space", "offset": offset, "max_chars": 1200},
+                    )
+                )
+                assert rn["cached"] is True
+                chunks.append(rn["markdown"])
+                offset = rn["next_offset"]
+            assert "".join(chunks) == full_blog_md
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape")) == 1
+
+            # 2) web_scrape_pdf: max_chars clamped to MAX_SINGLE_READ_CHARS (2000), find_keyword jumps in cache, refresh=True refetches
+            r_pdf1 = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
-                    {"name": "web_scrape_pdf", "arguments": {"url": "https://example.com/a.pdf", "max_chars": 0}},
+                    {"name": "web_scrape_pdf", "arguments": {"url": "https://example.com/a.pdf", "max_chars": 999999}},
                 )
             )
-            assert len(r_pdf["markdown"]) > 500  # max_chars <= 0 disables truncation
+            assert r_pdf1["cached"] is False
+            assert r_pdf1["returned_chars"] == 2000
+            assert r_pdf1["truncated"] is True
 
+            r_pdf_kw = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_scrape_pdf",
+                        "arguments": {
+                            "url": "https://example.com/a.pdf",
+                            "find_keyword": "Stokes theorem",
+                            "max_chars": 1000,
+                        },
+                    },
+                )
+            )
+            assert r_pdf_kw["cached"] is True
+            assert r_pdf_kw["keyword_search"]["matched"] is True
+            assert "Stokes theorem" in r_pdf_kw["markdown"]
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape")) == 2
+
+            r_pdf_refresh = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_scrape_pdf",
+                        "arguments": {"url": "https://example.com/a.pdf", "refresh": True},
+                    },
+                )
+            )
+            assert r_pdf_refresh["cached"] is False
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/scrape")) == 3
+
+            # 3) web_crawl soft guardrail + confirm_large + web_crawl_status pagination & cache warming
+            r_crawl_guard = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {"name": "web_crawl", "arguments": {"url": "https://example.com", "limit": 50}},
+                )
+            )
+            assert r_crawl_guard["needs_confirmation"] is True
+            assert sum(1 for m, p, _ in recorded_fc if (m, p) == ("POST", "/v2/crawl")) == 0
+
+            r_crawl_ok = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {"name": "web_crawl", "arguments": {"url": "https://example.com", "limit": 50, "confirm_large": True}},
+                )
+            )
+            assert r_crawl_ok["id"] == "crawl_999"
+
+            r_crawl_p1 = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {"name": "web_crawl_status", "arguments": {"crawl_id": "crawl_999", "page_offset": 0, "page_limit": 2}},
+                )
+            )
+            assert r_crawl_p1["total_pages"] == 4
+            assert r_crawl_p1["returned_pages"] == 2
+            assert r_crawl_p1["next_page_offset"] == 2
+
+            # Crawled page should now be cached for web_scrape at 0 extra credits
+            r_warm = _parse_tool_payload(
+                await client.call_tool("web_scrape", {"url": "https://example.com/p3"})
+            )
+            assert r_warm["cached"] is True
+            assert "Crawled page 3" in r_warm["markdown"]
+
+            # 4) web_batch_scrape soft guardrail + pagination
+            r_batch_guard = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {"name": "web_batch_scrape", "arguments": {"urls": [f"https://example.com/b{i}" for i in range(4)]}},
+                )
+            )
+            assert r_batch_guard["needs_confirmation"] is True
+
+            r_batch_ok = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_batch_scrape",
+                        "arguments": {
+                            "urls": [f"https://example.com/b{i}" for i in range(4)],
+                            "confirm_large": True,
+                            "page_offset": 2,
+                            "page_limit": 2,
+                        },
+                    },
+                )
+            )
+            assert r_batch_ok["total_pages"] == 4
+            assert r_batch_ok["returned_pages"] == 2
+            assert r_batch_ok["next_page_offset"] is None
+
+            # 5) web_extract_structured soft guardrail + normal run
+            r_ext_guard = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_extract_structured",
+                        "arguments": {"urls": ["https://a.com", "https://b.com", "https://c.com"], "prompt": "extract"},
+                    },
+                )
+            )
+            assert r_ext_guard["needs_confirmation"] is True
+
+            r_extract = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_extract_structured",
+                        "arguments": {"urls": ["https://example.com"], "prompt": "extract title"},
+                    },
+                )
+            )
+            assert r_extract["data"]["title"] == "OK"
+
+            # 6) Interact session + credit check
             r_start = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
@@ -263,6 +442,7 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
                 )
             )
             assert r_start["scrape_id"] == "scr_123"
+            assert "web_interact_stop" in r_start["reminder"]
 
             r_act = _parse_tool_payload(
                 await client.call_tool(
@@ -281,17 +461,6 @@ async def test_etalib_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> N
                 await client.call_tool("call_tool", {"name": "web_check_credit_usage", "arguments": {}})
             )
             assert r_credits["data"]["remainingCredits"] == 4500
-
-            r_extract = _parse_tool_payload(
-                await client.call_tool(
-                    "call_tool",
-                    {
-                        "name": "web_extract_structured",
-                        "arguments": {"urls": ["https://example.com"], "prompt": "extract title"},
-                    },
-                )
-            )
-            assert r_extract["data"]["title"] == "OK"
 
         # Upstream connection error must return clean isError without crashing server
         def broken_notes(_request: httpx.Request) -> httpx.Response:

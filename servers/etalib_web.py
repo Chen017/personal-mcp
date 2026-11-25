@@ -5,7 +5,8 @@ import json
 import os
 import time
 import uuid
-from typing import Literal
+from collections import OrderedDict
+from typing import Any, Literal
 from weakref import WeakKeyDictionary
 
 import httpx
@@ -22,6 +23,8 @@ SERVER_INSTRUCTIONS = """
 Personal notes and web-reading MCP hub combining:
 1. Etalib Notes (note.etalib.space): read-only access to personal SiYuan shared notes. ONLY invoke notes_* tools when the user explicitly provides a note.etalib.space/etalib.space URL OR explicitly asks to check/search their personal notes; for general knowledge or conceptual questions without explicit mention of notes, answer directly using general knowledge without calling notes_* tools.
 2. Firecrawl Web Tools: fallback web scraping/crawling for inaccessible URLs (including www.etalib.space, JS-rendered pages, remote PDFs, and GOOGLE_EXTENDED_OPT_OUT sites).
+   - `web_scrape` and `web_scrape_pdf` cache full extracted Markdown locally in memory (TTL ~30 min) and support `offset` pagination + `find_keyword` jumping at ZERO extra Firecrawl credits.
+   - Multi-page tools (`web_crawl`, `web_batch_scrape`, `web_extract_structured`) enforce soft confirmation limits to prevent accidental credit burn; if a call returns `needs_confirmation=True`, ask the user and retry with `confirm_large=True` (or use `web_map` + `web_scrape`).
 
 IMPORTANT for hidden tools: always pass ENGLISH keywords to `search_tools`, then invoke with `call_tool`.
 Hidden tools available via `search_tools` + `call_tool`:
@@ -65,6 +68,12 @@ _test_transports: dict[str, httpx.AsyncBaseTransport | None] = {
     "notes": None,
     "firecrawl": None,
 }
+_web_cache: OrderedDict[tuple[str, str, str], tuple[float, dict[str, Any]]] = OrderedDict()
+
+
+def clear_web_cache() -> None:
+    """Clear the in-memory Firecrawl markdown cache."""
+    _web_cache.clear()
 
 
 def set_test_transports(
@@ -76,6 +85,7 @@ def set_test_transports(
     _test_transports["notes"] = notes
     _test_transports["firecrawl"] = firecrawl
     _loop_clients.clear()
+    clear_web_cache()
 
 
 def _default_note_chars() -> int:
@@ -84,6 +94,174 @@ def _default_note_chars() -> int:
 
 def _default_web_chars() -> int:
     return int(os.getenv("DEFAULT_WEB_CHARS", "16000"))
+
+
+def _max_single_read_chars() -> int:
+    return max(2000, int(os.getenv("MAX_SINGLE_READ_CHARS", "32000")))
+
+
+def _web_cache_ttl() -> int:
+    return max(60, int(os.getenv("WEB_CACHE_TTL_SECONDS", "1800")))
+
+
+def _web_cache_max_entries() -> int:
+    return max(4, int(os.getenv("WEB_CACHE_MAX_ENTRIES", "32")))
+
+
+def _crawl_soft_max_pages() -> int:
+    return max(1, int(os.getenv("CRAWL_SOFT_MAX_PAGES", "20")))
+
+
+def _batch_soft_max_urls() -> int:
+    return max(1, int(os.getenv("BATCH_SOFT_MAX_URLS", "15")))
+
+
+def _extract_soft_max_urls() -> int:
+    return max(1, int(os.getenv("EXTRACT_SOFT_MAX_URLS", "10")))
+
+
+def _get_cached_web(kind: str, url: str, variant: str) -> dict[str, Any] | None:
+    key = (kind, url, variant)
+    entry = _web_cache.get(key)
+    if entry is None:
+        return None
+    cached_at, payload = entry
+    if (time.monotonic() - cached_at) > _web_cache_ttl():
+        _web_cache.pop(key, None)
+        return None
+    _web_cache.move_to_end(key)
+    return payload
+
+
+def _set_cached_web(kind: str, url: str, variant: str, markdown: str, metadata: dict[str, Any]) -> None:
+    key = (kind, url, variant)
+    _web_cache[key] = (time.monotonic(), {"markdown": markdown, "metadata": metadata})
+    _web_cache.move_to_end(key)
+    max_entries = _web_cache_max_entries()
+    while len(_web_cache) > max_entries:
+        _web_cache.popitem(last=False)
+
+
+def _cache_crawl_pages(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        md = item.get("markdown")
+        if not isinstance(md, str) or not md:
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        page_url = ""
+        for candidate in (meta.get("sourceURL"), meta.get("url"), item.get("url")):
+            if isinstance(candidate, str) and candidate.strip():
+                page_url = candidate.strip()
+                break
+        if page_url:
+            _set_cached_web("scrape", page_url, "main=True", md, meta)
+
+
+def _clamp_single_read_chars(requested: int | None, default_chars: int | None = None) -> int:
+    ceiling = _max_single_read_chars()
+    base = default_chars if default_chars is not None else _default_web_chars()
+    val = requested if (requested is not None and requested > 0) else base
+    return max(1000, min(val, ceiling))
+
+
+def _slice_cached_markdown(
+    full_md: str,
+    *,
+    offset: int = 0,
+    max_chars: int | None = None,
+    find_keyword: str = "",
+) -> dict[str, Any]:
+    total = len(full_md)
+    window = _clamp_single_read_chars(max_chars)
+    start = max(0, min(offset, total))
+    keyword = find_keyword.strip()
+    keyword_info: dict[str, Any] | None = None
+
+    if keyword:
+        lower_md = full_md.lower()
+        lower_kw = keyword.lower()
+        total_matches = lower_md.count(lower_kw)
+        match_idx = lower_md.find(lower_kw, start)
+        if match_idx == -1:
+            keyword_info = {
+                "keyword": keyword,
+                "matched": False,
+                "match_offset": None,
+                "total_matches": total_matches,
+                "note": f"Keyword '{keyword}' not found at or after offset {start}.",
+            }
+        else:
+            start = max(0, match_idx - 300)
+            keyword_info = {
+                "keyword": keyword,
+                "matched": True,
+                "match_offset": match_idx,
+                "total_matches": total_matches,
+            }
+
+    end = min(total, start + window)
+    chunk = full_md[start:end]
+    next_offset = end if end < total else None
+    truncated = next_offset is not None
+
+    hint = ""
+    if truncated:
+        hint = (
+            f"Showing chars {start:,}..{end:,} of {total:,} (capped at <= {_max_single_read_chars():,} per read). "
+            f"Full text is cached locally: call again with offset={next_offset} or find_keyword='...' "
+            f"to continue reading at 0 extra Firecrawl credits."
+        )
+
+    out: dict[str, Any] = {
+        "total_chars": total,
+        "offset": start,
+        "returned_chars": len(chunk),
+        "next_offset": next_offset,
+        "truncated": truncated,
+        "hint": hint,
+        "markdown": chunk,
+    }
+    if keyword_info is not None:
+        out["keyword_search"] = keyword_info
+    return out
+
+
+def _paginate_page_items(
+    items: list[dict[str, Any]],
+    *,
+    page_offset: int,
+    page_limit: int,
+    max_chars_per_page: int,
+) -> dict[str, Any]:
+    total_pages = len(items)
+    p_start = max(0, min(page_offset, total_pages))
+    p_limit = max(1, min(page_limit, 20))
+    p_end = min(total_pages, p_start + p_limit)
+    clamped_chars = max(500, min(max_chars_per_page, _max_single_read_chars()))
+
+    paged: list[dict[str, Any]] = []
+    for item in items[p_start:p_end]:
+        if not isinstance(item, dict):
+            continue
+        copy = dict(item)
+        if isinstance(copy.get("markdown"), str):
+            copy["markdown"] = truncate_text(
+                copy["markdown"],
+                max_chars=clamped_chars,
+                hint="Full page cached locally; call web_scrape(url, offset=...) to read the rest at 0 credits.",
+            )
+        paged.append(copy)
+
+    next_page_offset = p_end if p_end < total_pages else None
+    return {
+        "total_pages": total_pages,
+        "page_offset": p_start,
+        "returned_pages": len(paged),
+        "next_page_offset": next_page_offset,
+        "pages": paged,
+    }
 
 
 def _get_notes_client() -> tuple[httpx.AsyncClient | None, str | None, str]:
@@ -171,22 +349,6 @@ async def _fc_request(method: str, path: str, **kwargs) -> dict:
         return resp.json() if resp.content else {}
     except Exception as exc:
         return {"isError": True, "error": format_http_error("Firecrawl v2", exc)}
-
-
-def _truncate_page_items(items: list[dict], max_chars_per_page: int) -> list[dict]:
-    truncated_items: list[dict] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        copy = dict(item)
-        if isinstance(copy.get("markdown"), str):
-            copy["markdown"] = truncate_text(
-                copy["markdown"],
-                max_chars=max_chars_per_page,
-                hint="Use web_scrape on a specific URL with larger max_chars if full page text is needed.",
-            )
-        truncated_items.append(copy)
-    return truncated_items
 
 
 def _extract_scrape_id(scrape_resp: dict) -> str:
@@ -283,31 +445,43 @@ async def notes_get_document_outline(share: str, doc_id: str = "") -> dict:
 # ==================== 2. Firecrawl v2 工具（11 个：2 置顶 + 9 隐藏） ====================
 
 
-@mcp.tool(annotations={"title": "Scrape Webpage (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
+@mcp.tool(annotations={"title": "Scrape Webpage (Firecrawl v2 + Cache Pagination)", **READ_ONLY_ANNOTATIONS})
 async def web_scrape(
     url: str,
     only_main_content: bool = True,
+    offset: int = 0,
     max_chars: int | None = None,
+    find_keyword: str = "",
     wait_for_ms: int = 0,
+    refresh: bool = False,
 ) -> dict:
-    """Scrape a single webpage or blog post (including www.etalib.space or JS-rendered pages) into clean Markdown.
+    """Scrape a webpage into clean Markdown and cache it locally for zero-cost `offset` pagination and `find_keyword` jumping.
     Use when built-in browsing fails or hits GOOGLE_EXTENDED_OPT_OUT.
-    Keywords: firecrawl scrape webpage url read article markdown js render opt_out etalib blog.
+    Keywords: firecrawl scrape webpage url read article markdown js render opt_out etalib blog offset cache.
     """
-    effective_max = max_chars if max_chars is not None else _default_web_chars()
-    payload: dict = {"url": url, "formats": ["markdown"], "onlyMainContent": only_main_content}
+    variant = f"main={only_main_content}"
+    cached_entry = None if refresh else _get_cached_web("scrape", url, variant)
+    if cached_entry is not None:
+        sliced = _slice_cached_markdown(
+            cached_entry["markdown"],
+            offset=offset,
+            max_chars=max_chars,
+            find_keyword=find_keyword,
+        )
+        return {"url": url, "cached": True, "metadata": cached_entry["metadata"], **sliced}
+
+    payload: dict[str, Any] = {"url": url, "formats": ["markdown"], "onlyMainContent": only_main_content}
     if wait_for_ms > 0:
         payload["waitFor"] = wait_for_ms
     res = await _fc_request("POST", "/scrape", json=payload)
     if res.get("isError"):
         return res
     data = res.get("data") or {}
-    md = truncate_text(
-        data.get("markdown") or "",
-        max_chars=effective_max,
-        hint="Pass larger max_chars if full text is required.",
-    )
-    return {"url": url, "metadata": data.get("metadata") or {}, "markdown": md}
+    full_md = data.get("markdown") or ""
+    metadata = data.get("metadata") or {}
+    _set_cached_web("scrape", url, variant, full_md, metadata)
+    sliced = _slice_cached_markdown(full_md, offset=offset, max_chars=max_chars, find_keyword=find_keyword)
+    return {"url": url, "cached": False, "metadata": metadata, **sliced}
 
 
 @mcp.tool(annotations={"title": "Map Website Sub-links (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
@@ -315,7 +489,7 @@ async def web_map(url: str, search: str = "", limit: int = 50) -> dict:
     """Discover and enumerate sub-page URLs under a website before selectively scraping target pages.
     Keywords: firecrawl map sitemap links directory subpages discover urls.
     """
-    payload: dict = {"url": url, "limit": max(1, limit)}
+    payload: dict[str, Any] = {"url": url, "limit": max(1, limit)}
     if search:
         payload["search"] = search
     return await _fc_request("POST", "/map", json=payload)
@@ -329,11 +503,25 @@ async def web_crawl(
     include_paths: list[str] | None = None,
     exclude_paths: list[str] | None = None,
     only_main_content: bool = True,
+    confirm_large: bool = False,
 ) -> dict:
     """Start an asynchronous multi-page crawl job across a website and return its crawl_id for web_crawl_status.
+    If limit exceeds the soft guardrail, returns needs_confirmation=True unless confirm_large=True.
     Keywords: firecrawl crawl multiple subpages spider site recursive.
     """
-    payload: dict = {
+    soft_limit = _crawl_soft_max_pages()
+    if limit > soft_limit and not confirm_large:
+        return {
+            "needs_confirmation": True,
+            "requested_limit": limit,
+            "soft_limit": soft_limit,
+            "message": (
+                f"Crawl limit {limit} exceeds soft guardrail ({soft_limit} pages). "
+                f"Ask the user to confirm before calling again with confirm_large=True, "
+                f"or use web_map + selective web_scrape instead."
+            ),
+        }
+    payload: dict[str, Any] = {
         "url": url,
         "limit": max(1, limit),
         "maxDiscoveryDepth": max(0, max_depth),
@@ -346,17 +534,31 @@ async def web_crawl(
     return await _fc_request("POST", "/crawl", json=payload)
 
 
-@mcp.tool(annotations={"title": "Get Crawl Job Status & Pages (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
-async def web_crawl_status(crawl_id: str, max_chars_per_page: int = 6000) -> dict:
-    """Check progress and retrieve crawled Markdown pages from a Firecrawl crawl job id.
-    Keywords: firecrawl crawl status job progress results pages.
+@mcp.tool(annotations={"title": "Get Crawl Job Status & Paginated Pages (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
+async def web_crawl_status(
+    crawl_id: str,
+    page_offset: int = 0,
+    page_limit: int = 5,
+    max_chars_per_page: int = 6000,
+) -> dict:
+    """Check progress and retrieve crawled Markdown pages with page_offset/page_limit pagination.
+    Also caches each crawled page locally so web_scrape(url, offset=...) can read truncated pages at 0 extra credits.
+    Keywords: firecrawl crawl status job progress results pages pagination.
     """
     res = await _fc_request("GET", f"/crawl/{crawl_id}")
     if res.get("isError"):
         return res
     out = dict(res)
-    if isinstance(out.get("data"), list):
-        out["data"] = _truncate_page_items(out["data"], max_chars_per_page)
+    raw_pages = out.pop("data", None)
+    if isinstance(raw_pages, list):
+        _cache_crawl_pages(raw_pages)
+        paged = _paginate_page_items(
+            raw_pages,
+            page_offset=page_offset,
+            page_limit=page_limit,
+            max_chars_per_page=max_chars_per_page,
+        )
+        out.update(paged)
     return out
 
 
@@ -367,10 +569,13 @@ async def web_batch_scrape(
     wait: bool = True,
     poll_interval_sec: float = 2.0,
     timeout_sec: float = 90.0,
+    page_offset: int = 0,
+    page_limit: int = 5,
     max_chars_per_page: int = 6000,
     batch_id: str = "",
+    confirm_large: bool = False,
 ) -> dict:
-    """Batch scrape multiple URLs in parallel or poll an existing batch_id for results.
+    """Batch scrape multiple URLs in parallel or poll an existing batch_id with page_offset/page_limit pagination.
     Keywords: firecrawl batch scrape multiple urls list parallel.
     """
     if batch_id:
@@ -378,12 +583,33 @@ async def web_batch_scrape(
         if res.get("isError"):
             return res
         out = dict(res)
-        if isinstance(out.get("data"), list):
-            out["data"] = _truncate_page_items(out["data"], max_chars_per_page)
+        raw_pages = out.pop("data", None)
+        if isinstance(raw_pages, list):
+            _cache_crawl_pages(raw_pages)
+            out.update(
+                _paginate_page_items(
+                    raw_pages,
+                    page_offset=page_offset,
+                    page_limit=page_limit,
+                    max_chars_per_page=max_chars_per_page,
+                )
+            )
         return out
 
     if not urls:
         return {"isError": True, "error": "Provide either non-empty urls or an existing batch_id."}
+
+    soft_limit = _batch_soft_max_urls()
+    if len(urls) > soft_limit and not confirm_large:
+        return {
+            "needs_confirmation": True,
+            "requested_urls": len(urls),
+            "soft_limit": soft_limit,
+            "message": (
+                f"Batch scrape has {len(urls)} URLs, exceeding soft guardrail ({soft_limit}). "
+                f"Ask the user to confirm before calling again with confirm_large=True."
+            ),
+        }
 
     start = await _fc_request(
         "POST",
@@ -405,8 +631,17 @@ async def web_batch_scrape(
         status = str(status_res.get("status") or "").lower()
         if status in {"completed", "failed", "cancelled"}:
             out = dict(status_res)
-            if isinstance(out.get("data"), list):
-                out["data"] = _truncate_page_items(out["data"], max_chars_per_page)
+            raw_pages = out.pop("data", None)
+            if isinstance(raw_pages, list):
+                _cache_crawl_pages(raw_pages)
+                out.update(
+                    _paginate_page_items(
+                        raw_pages,
+                        page_offset=page_offset,
+                        page_limit=page_limit,
+                        max_chars_per_page=max_chars_per_page,
+                    )
+                )
             return out
         await asyncio.sleep(max(0.2, poll_interval_sec))
 
@@ -425,13 +660,26 @@ async def web_extract_structured(
     wait: bool = True,
     poll_interval_sec: float = 2.0,
     timeout_sec: float = 90.0,
+    confirm_large: bool = False,
 ) -> dict:
     """Extract structured JSON data from one or more URLs (supports wildcards) using a natural language prompt and optional JSON Schema.
     Keywords: firecrawl extract structured json schema data parse fields.
     """
     if not urls:
         return {"isError": True, "error": "urls must be a non-empty list."}
-    payload: dict = {"urls": urls, "prompt": prompt}
+    soft_limit = _extract_soft_max_urls()
+    if len(urls) > soft_limit and not confirm_large:
+        return {
+            "needs_confirmation": True,
+            "requested_urls": len(urls),
+            "soft_limit": soft_limit,
+            "message": (
+                f"Structured extract targets {len(urls)} URLs, exceeding soft guardrail ({soft_limit}). "
+                f"Ask the user to confirm before calling again with confirm_large=True."
+            ),
+        }
+
+    payload: dict[str, Any] = {"urls": urls, "prompt": prompt}
     if schema_json.strip():
         try:
             parsed_schema = json.loads(schema_json)
@@ -467,16 +715,29 @@ async def web_extract_structured(
     }
 
 
-@mcp.tool(annotations={"title": "Scrape & Parse Remote PDF (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
+@mcp.tool(annotations={"title": "Scrape & Parse Remote PDF (Firecrawl v2 + Cache Pagination)", **READ_ONLY_ANNOTATIONS})
 async def web_scrape_pdf(
     url: str,
     mode: Literal["auto", "fast", "ocr"] = "auto",
+    offset: int = 0,
     max_chars: int | None = None,
+    find_keyword: str = "",
+    refresh: bool = False,
 ) -> dict:
-    """Download and parse a remote PDF document into Markdown using Firecrawl v2 PDF parser.
-    Keywords: firecrawl parse remote pdf document paper file extract text.
+    """Download and parse a remote PDF document into Markdown, caching full text locally for 0-credit `offset` pagination and `find_keyword` jumping.
+    Keywords: firecrawl parse remote pdf document paper file extract text offset cache.
     """
-    effective_max = max_chars if max_chars is not None else _default_web_chars()
+    variant = f"mode={mode}"
+    cached_entry = None if refresh else _get_cached_web("pdf", url, variant)
+    if cached_entry is not None:
+        sliced = _slice_cached_markdown(
+            cached_entry["markdown"],
+            offset=offset,
+            max_chars=max_chars,
+            find_keyword=find_keyword,
+        )
+        return {"url": url, "cached": True, "metadata": cached_entry["metadata"], **sliced}
+
     payload = {
         "url": url,
         "formats": ["markdown"],
@@ -486,12 +747,11 @@ async def web_scrape_pdf(
     if res.get("isError"):
         return res
     data = res.get("data") or {}
-    md = truncate_text(
-        data.get("markdown") or "",
-        max_chars=effective_max,
-        hint="Pass larger max_chars (or <= 0 for full text) if the PDF output was truncated.",
-    )
-    return {"url": url, "metadata": data.get("metadata") or {}, "markdown": md}
+    full_md = data.get("markdown") or ""
+    metadata = data.get("metadata") or {}
+    _set_cached_web("pdf", url, variant, full_md, metadata)
+    sliced = _slice_cached_markdown(full_md, offset=offset, max_chars=max_chars, find_keyword=find_keyword)
+    return {"url": url, "cached": False, "metadata": metadata, **sliced}
 
 
 @mcp.tool(annotations={"title": "Start Interactive Browser Session (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
@@ -500,7 +760,7 @@ async def web_interact_start(url: str, max_chars: int | None = None) -> dict:
     Always call web_interact_stop(scrape_id) when finished.
     Keywords: firecrawl browser interact start session open click login dynamic.
     """
-    effective_max = max_chars if max_chars is not None else _default_web_chars()
+    effective_max = _clamp_single_read_chars(max_chars)
     res = await _fc_request("POST", "/scrape", json={"url": url, "formats": ["markdown"]})
     if res.get("isError"):
         return res
@@ -512,6 +772,7 @@ async def web_interact_start(url: str, max_chars: int | None = None) -> dict:
         "scrape_id": scrape_id,
         "metadata": data.get("metadata") or {},
         "markdown": md,
+        "reminder": "Remember to call web_interact_stop(scrape_id) immediately when done.",
     }
 
 
@@ -534,8 +795,8 @@ async def web_interact_action(
     """
     if not prompt.strip() and not code.strip():
         return {"isError": True, "error": "Provide either prompt or code for web_interact_action."}
-    effective_max = max_chars if max_chars is not None else _default_web_chars()
-    payload: dict = {}
+    effective_max = _clamp_single_read_chars(max_chars)
+    payload: dict[str, Any] = {}
     if prompt.strip():
         payload["prompt"] = prompt
     if code.strip():
@@ -548,6 +809,7 @@ async def web_interact_action(
     for key in ("output", "markdown", "stdout", "result"):
         if isinstance(out.get(key), str):
             out[key] = truncate_text(out[key], max_chars=effective_max)
+    out["reminder"] = "Remember to call web_interact_stop(scrape_id) immediately when done."
     return out
 
 
