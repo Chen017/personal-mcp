@@ -46,10 +46,10 @@
 │ Server 1: Personal Notes Web (:8101)  │   │ Server 2: GitHub Personal (:8102)     │
 │ systemd: mcp-notes-web.service        │   │ systemd: mcp-github.service           │
 │                                       │   │                                       │
-│ • 后端 17 工具 -> 对外暴露 8 个       │   │ • 后端 23 工具 -> 对外暴露 12 个      │
+│ • 后端 17 工具 -> 对外暴露 8 个       │   │ • 后端 25 工具 -> 对外暴露 13 个      │
 │ • 思源分享 JSON-RPC 客户端 (5 工具)   │   │ • 复用 httpx -> GitHub REST API       │
 │ • Firecrawl v2 全功能封装 (12 工具)   │   │ • Fine-Grained PAT + Owner 写白名单   │
-│ • 本地 LRU+TTL 缓存 + offset 续读     │   │ • 全部 6 个写工具置顶直出             │
+│ • 本地 LRU+TTL 缓存 + offset 续读     │   │ • 全部 7 个写工具置顶直出             │
 │ • BM25SearchTransform (Markdown)      │   │ • BM25SearchTransform (Markdown)      │
 └───────────────────────────────────────┘   └───────────────────────────────────────┘
           │
@@ -64,14 +64,15 @@
 | 服务 | 监听地址 | 对外暴露 (`list_tools`) | 后端总工具 | 置顶工具 (`always_visible`) | BM25 隐藏工具 (`search_tools` + `call_tool`) |
 | :--- | :---: | :---: | :---: | :--- | :--- |
 | **Personal Notes Web** (`servers.notes_web`) | `127.0.0.1:8101` | **8** | **17** | `notes_search_notes`, `notes_read_document`, `notes_list_shares`, `web_search`, `web_scrape`, `web_map` | `notes_get_share_tree`, `notes_get_document_outline`, `web_crawl`, `web_crawl_status`, `web_batch_scrape`, `web_extract_structured`, `web_scrape_pdf`, `web_interact_start`, `web_interact_action`, `web_interact_stop`, `web_check_credit_usage` |
-| **GitHub Personal** (`servers.github_personal`) | `127.0.0.1:8102` | **12** | **23** | **4 读**：`gh_list_repos`, `gh_get_repo_tree`, `gh_get_file_contents`, `gh_search_code`<br>**6 写 (`destructiveHint=True`)**：`gh_create_or_update_file`, `gh_create_pull_request`, `gh_create_branch`, `gh_push_multiple_files`, `gh_create_issue`, `gh_comment_issue_or_pr` | **13 只读/下载**：`gh_get_repo_info`, `gh_list_branches`, `gh_list_commits`, `gh_get_commit_diff`, `gh_compare_commits`, `gh_list_issues`, `gh_get_issue`, `gh_list_pull_requests`, `gh_get_pull_request_detail`, `gh_list_releases`, `gh_list_workflow_runs`, `gh_get_archive_download_url`, `gh_fetch_directory_bundle` |
+| **GitHub Personal** (`servers.github_personal`) | `127.0.0.1:8102` | **13** | **25** | **4 读**：`gh_list_repos`, `gh_get_repo_tree`, `gh_get_file_contents`, `gh_search_code`<br>**7 写 (`destructiveHint=True`)**：`gh_create_or_update_file`, `gh_patch_files`, `gh_create_pull_request`, `gh_create_branch`, `gh_push_multiple_files`, `gh_create_issue`, `gh_comment_issue_or_pr` | **14 只读/下载**：`gh_get_repo_info`, `gh_list_branches`, `gh_list_commits`, `gh_get_commit_diff`, `gh_compare_commits`, `gh_list_issues`, `gh_get_issue`, `gh_list_pull_requests`, `gh_get_pull_request_detail`, `gh_list_releases`, `gh_list_workflow_runs`, `gh_get_workflow_run_jobs`, `gh_get_archive_download_url`, `gh_fetch_directory_bundle` |
 
 ---
 
 ## 🛡️ 核心工程保障
 
 - **无状态 Streamable HTTP（`stateless_http=True`）**：每个 JSON-RPC 请求独立处理，服务端重启或移动端长时间休眠后不会出现 `404 Session terminated`。
-- **写操作原生确认与白名单双保险**：全部 6 个 GitHub 写工具均直出并标记 `destructiveHint=True`（绝不藏进 BM25 代理），且由服务端 `GITHUB_ALLOWED_WRITE_OWNERS` 硬限制（未配置时默认拒绝所有写操作）。
+- **写操作原生确认与白名单双保险**：全部 7 个 GitHub 写工具均直出并标记 `destructiveHint=True`（绝不藏进 BM25 代理），且由服务端 `GITHUB_ALLOWED_WRITE_OWNERS` 硬限制（未配置时默认拒绝所有写操作）。
+- **服务端局部补丁与防截断覆盖护栏**：`gh_patch_files` 在服务端内存拉取完整文件并执行严格唯一匹配的局部替换与单次原子提交（保留原文件 CRLF/LF 与权限位），彻底避免大模型整文件输出截断；`gh_create_or_update_file` 与 `gh_push_multiple_files` 默认拦截对大文件的危险缩减/截断覆盖（除非显式传入 `allow_large_overwrite=True`），并支持通过 `delete_paths` 原子删除或重命名文件。
 - **0 额度本地缓存分页续读**：`web_scrape` 与 `web_scrape_pdf` 在抓取一次后将完整 Markdown 缓存在本地 LRU + TTL 内存中（默认 30 分钟）。后续传 `offset` 翻页或 `find_keyword` 页内定位均命中缓存，**消耗 0 额外 Firecrawl 额度**，单次返回上限受 `MAX_SINGLE_READ_CHARS`（默认 `32000`）保护。
 - **软上限护栏而不堵死大任务**：`web_search` 在代码层强制禁止 `scrapeOptions` 且 `limit <= 10`（严格固定 2 credits/次，同查询本地缓存命中 0 消耗），作为内置搜索后的二次核查兜底；`web_crawl`、`web_batch_scrape` 与 `web_extract_structured` 超出默认阈值时先返回 `needs_confirmation=True`，确认后传 `confirm_large=True` 即可放行。
 - **隐私与防探测**：Capability URL 采用 64 位随机十六进制路径，搭配反代 `access_log off`（Nginx）/ `log_skip`（Caddy）和 `proxy_buffering off`。

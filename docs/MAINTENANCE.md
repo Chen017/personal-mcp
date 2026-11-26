@@ -25,7 +25,7 @@ This guide documents repository layout, design boundaries, testing, CI/CD workfl
 │   └── MAINTENANCE.md             # This file
 ├── servers/
 │   ├── notes_web.py               # Server 1: SiYuan Notes RPC wrapper (5) + Firecrawl v2 (12)
-│   └── github_personal.py         # Server 2: GitHub REST API wrapper (23)
+│   └── github_personal.py         # Server 2: GitHub REST API wrapper (25)
 ├── tests/
 │   ├── test_bm25_recall.py        # Tool counts, annotations, BM25 recall, mock integration & ASGI HTTP smoke
 │   └── test_repo_hygiene.py       # Markdown link checks, LF enforcement, and PII/desensitization guard
@@ -47,14 +47,19 @@ The SiYuan Share MCP backend is stateless POST-only JSON-RPC (`GET`/`DELETE` ret
 - Let us write clean bilingual docstrings and English BM25 `Keywords:` lines on every wrapped tool;
 - Keep upstream connection failures isolated (`isError=True` instead of crashing the server).
 
-### 2. Why All 6 GitHub Write Tools Are Pinned in `always_visible`
-`BM25SearchTransform` hides non-pinned tools behind a synthetic `call_tool(name, arguments)` proxy. MCP clients inspect `annotations` on the exposed tool (`call_tool`), not on hidden target tools, so hiding mutating tools behind `call_tool` strips `destructiveHint=True` confirmation prompts. Pinning all 6 write tools preserves native host confirmations while `GITHUB_ALLOWED_WRITE_OWNERS` enforces server-side owner allowlisting (fail-closed if empty).
+### 2. Why All 7 GitHub Write Tools Are Pinned in `always_visible`
+`BM25SearchTransform` hides non-pinned tools behind a synthetic `call_tool(name, arguments)` proxy. MCP clients inspect `annotations` on the exposed tool (`call_tool`), not on hidden target tools, so hiding mutating tools behind `call_tool` strips `destructiveHint=True` confirmation prompts. Pinning all 7 write tools preserves native host confirmations while `GITHUB_ALLOWED_WRITE_OWNERS` enforces server-side owner allowlisting (fail-closed if empty).
 
 ### 3. Why `SERVER_INSTRUCTIONS` Stays Positive While Saved Info Enforces Restraint
 Gemini's pre-router evaluates App name, `instructions`, and exposed tool descriptions **before** built-in web search or Saved Info run. Putting negative clauses (`ONLY invoke...`, `Do NOT use...`, `only when built-in browsing fails`) inside `SERVER_INSTRUCTIONS` causes the pre-router to skip mounting the MCP server on turn 1. Keep `SERVER_INSTRUCTIONS` purely descriptive and positive; place restraint rules (such as avoiding unsolicited notes lookups) in client-side Saved Info.
 
 ### 4. Local Cache Pagination vs. Single-Read Ceiling
 `web_scrape` and `web_scrape_pdf` cache full extracted Markdown in an in-memory `OrderedDict` (LRU + TTL). Every response clamps `max_chars` to `[1000, MAX_SINGLE_READ_CHARS]` so a single tool call cannot overflow the client context window, while `offset` and `find_keyword` allow reading the entire document from local memory at zero extra Firecrawl credits.
+
+### 5. Server-Side Patching, Overwrite Guardrails & Actions Log Redirect Safety
+- **Server-side patching (`gh_patch_files`)**: Large files (e.g., 100+ KB JS/CSS) exceed LLM single-turn output limits if passed whole. `gh_patch_files` fetches full file bytes on the server, decodes strictly as UTF-8 (never `errors="replace"` on writes), enforces single unique matches, preserves CRLF/LF line endings and git file modes (`100644`/`100755`), supports `expected_head_sha` and `dry_run`, and returns a unified diff summary.
+- **Large-file overwrite guardrails & atomic deletes**: `gh_create_or_update_file` and `gh_push_multiple_files` block overwriting files `>= 50 KB` or sharply shrinking/placeholder-truncated files `>= 20 KB` unless `allow_large_overwrite=True`. `gh_push_multiple_files` also accepts `delete_paths` (`sha: None` tree entries) to delete or atomically refactor files in a single commit.
+- **Actions failure log redirect isolation**: `gh_get_workflow_run_jobs` queries `/actions/jobs/{job_id}/logs` without auto-redirecting, then follows GitHub's `302 Location` via a separate unauthenticated `httpx.AsyncClient` so `GITHUB_PAT` is never forwarded to external blob storage hosts, retaining trailing error lines via `truncate_tail`.
 
 ---
 

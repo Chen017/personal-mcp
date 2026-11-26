@@ -78,7 +78,7 @@ curl -s -X POST "https://${MCP_DOMAIN}/${SECRET_PATH_GITHUB}/mcp" \
    - **Authentication**: `No authentication`
 4. Open `https://gemini.google.com/devmode`, select each app, and click **Sync schema**:
    - `Personal Notes Web` should list **8** tools (including `web_search`).
-   - `GitHub Personal` should list **12** tools (with `destructiveHint=True` on all 6 write tools).
+   - `GitHub Personal` should list **13** tools (with `destructiveHint=True` on all 7 write tools).
 5. **Prevent note-tool hijacking**: If you do not store study notes in Google Keep, consider disabling the built-in **Google Keep** extension under Connected Apps so prompts like `"Check my notes..."` are not diverted away from your MCP server. Toggle the custom apps off/on once and refresh the browser tab after syncing schemas.
 
 ---
@@ -94,7 +94,7 @@ Paste these four cards into **Settings → Instructions for Gemini / Saved info*
 
 ### Card 2: `@GitHub Personal` (Read, Write, PR & Archive Download)
 ```text
-Always proactively invoke the @GitHub Personal MCP tools—even if I do not explicitly type @GitHub Personal—for any request involving GitHub, including GitHub URLs, repositories, source code, directories, READMEs, commits, branches, issues, pull requests, releases, actions, code downloads, or my personal account <your-github-username>. Prefer @GitHub Personal over built-in web search for all GitHub lookups. If a needed GitHub capability (such as viewing commit diffs, issues/PR details, workflow runs, or downloading repo archives) is hidden, query search_tools using ENGLISH keywords and invoke via call_tool. If @GitHub Personal is not mounted in the current session, do not fabricate repo details—simply ask me to reply with "@GitHub Personal". Always ask for my explicit confirmation before performing any write or mutating operation (modifying files, creating branches, pushing commits, opening issues, or submitting PRs).
+Always proactively invoke the @GitHub Personal MCP tools—even if I do not explicitly type @GitHub Personal—for any request involving GitHub, including GitHub URLs, repositories, source code, directories, READMEs, commits, branches, issues, pull requests, releases, actions, code downloads, or my personal account <your-github-username>. Prefer @GitHub Personal over built-in web search for all GitHub lookups. When inspecting large files, locate target sections with gh_get_file_contents(find_keyword=...). For modifying existing or large files, prefer gh_patch_files (passing short unique snippets without `N: ` line-number prefixes) rather than whole-file overwrites; use gh_push_multiple_files(delete_paths=...) when deleting or atomically refactoring multiple files. If a needed GitHub capability (such as viewing commit diffs, PR review comments, failed workflow job logs via gh_get_workflow_run_jobs, or downloading repo archives) is hidden, query search_tools using ENGLISH keywords and invoke via call_tool. If @GitHub Personal is not mounted in the current session, do not fabricate repo details—simply ask me to reply with "@GitHub Personal". Prefer working on a new feature branch and opening a Pull Request rather than committing directly to main. Always ask for my explicit confirmation before performing mutating operations (for multi-step coding tasks, present the target branch, planned edits, and PR plan for upfront confirmation before executing).
 ```
 
 ### Card 3: Two-Stage Web Search & Firecrawl Fallback

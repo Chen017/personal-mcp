@@ -86,9 +86,10 @@ async def test_exposed_tool_counts_annotations_and_flat_schemas() -> None:
     async with Client(github_personal.mcp) as c2:
         tools2 = await c2.list_tools()
     names2 = [t.name for t in tools2]
-    assert len(names2) == 12, f"Expected 12 tools on Server 2, got {len(names2)}: {names2}"
+    assert len(names2) == 13, f"Expected 13 tools on Server 2, got {len(names2)}: {names2}"
     expected_writes = {
         "gh_create_or_update_file",
+        "gh_patch_files",
         "gh_create_pull_request",
         "gh_create_branch",
         "gh_push_multiple_files",
@@ -134,7 +135,9 @@ async def test_bm25_english_recall_top3() -> None:
     server2_queries = [
         ("download repository zip archive", {"gh_get_archive_download_url"}),
         ("list pull requests and diff", {"gh_list_pull_requests", "gh_get_pull_request_detail"}),
+        ("pull request review comments feedback", {"gh_get_pull_request_detail"}),
         ("github actions workflow runs", {"gh_list_workflow_runs"}),
+        ("failed workflow run job logs error", {"gh_get_workflow_run_jobs"}),
         ("commit history and changes", {"gh_list_commits"}),
     ]
     async with Client(github_personal.mcp) as c2:
@@ -635,6 +638,8 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
             return httpx.Response(200, json={"object": {"sha": "commit_base"}})
         if request.method == "GET" and request.url.path == "/repos/alice/demo/git/commits/commit_base":
             return httpx.Response(200, json={"tree": {"sha": "tree_base"}})
+        if request.method == "GET" and request.url.path == "/repos/alice/demo/git/trees/tree_base":
+            return httpx.Response(200, json={"truncated": False, "tree": []})
         if request.method == "POST" and request.url.path == "/repos/alice/demo/git/blobs":
             return httpx.Response(201, json={"sha": f"blob_{len(body['content'])}"})
         if request.method == "POST" and request.url.path == "/repos/alice/demo/git/trees":
@@ -720,8 +725,659 @@ async def test_github_personal_mock_integration(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
+async def test_github_coding_workflow_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
+    monkeypatch.setenv("GITHUB_DEFAULT_OWNER", "alice")
+    monkeypatch.setenv("GITHUB_ALLOWED_WRITE_OWNERS", "alice")
+    monkeypatch.setenv("GITHUB_API_BASE_URL", "https://api.github.com")
+    monkeypatch.setenv("DEFAULT_FILE_LINES", "50")
+    monkeypatch.setenv("DEFAULT_FILE_CHARS", "32000")
+    monkeypatch.setenv("DEFAULT_DIFF_CHARS", "15000")
+
+    numbered_js = "\n".join(
+        [
+            *(f"const line_{i} = {i};" for i in range(1, 70)),
+            "function targetHandler(item) {",
+            "  return item.id;",
+            "}",
+            *(f"const tail_{i} = {i};" for i in range(73, 140)),
+            "function targetHandlerSecond() { return true; }",
+        ]
+    )
+    minified_js = "var a=1;" * 500
+    script_sh = "#!/usr/bin/env bash\necho start\nPORT=8080\necho middle\nRETRY=3\necho done\n"
+    crlf_txt = "alpha\r\nbeta\r\ngamma\r\ndelta\r\n"
+    dup_txt = "item()\nitem()\n"
+    large_60k_txt = "x" * 60_000
+    shrink_25k_txt = ("const row = 1;\n" * 1670)[:25_000]
+    bad_utf8_bytes = b"\xff\xfeinvalid_utf8_content"
+    bin_bytes = b"\x89PNG\r\n\x1a\n\x00\x00"
+
+    long_log = ("INFO running step...\n" * 400) + "ERROR: AssertionError in test_app.py:42\nEXIT CODE 1\n"
+
+    uploaded_blobs: list[str] = []
+    created_trees: list[dict[str, Any]] = []
+    put_requests: list[dict[str, Any]] = []
+    commit_counter = 0
+
+    def gh_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal commit_counter
+        if request.url.host == "pipelines.actions.githubusercontent.com":
+            assert "authorization" not in {k.lower() for k in request.headers.keys()}
+            return httpx.Response(200, content=long_log.encode("utf-8"))
+
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        path = request.url.path
+
+        if request.method == "GET" and path == "/repos/alice/app/contents/src/app.js":
+            return httpx.Response(
+                200,
+                json={
+                    "path": "src/app.js",
+                    "sha": "sha_app_js",
+                    "encoding": "base64",
+                    "content": base64.b64encode(numbered_js.encode("utf-8")).decode("ascii"),
+                    "html_url": "https://github.com/alice/app/blob/main/src/app.js",
+                },
+            )
+        if request.method == "GET" and path == "/repos/alice/app/contents/src/min.js":
+            return httpx.Response(
+                200,
+                json={
+                    "path": "src/min.js",
+                    "sha": "sha_min_js",
+                    "encoding": "base64",
+                    "content": base64.b64encode(minified_js.encode("utf-8")).decode("ascii"),
+                    "html_url": "https://github.com/alice/app/blob/main/src/min.js",
+                },
+            )
+        if request.method == "GET" and path == "/search/code":
+            assert request.headers.get("Accept") == "application/vnd.github.text-match+json"
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "items": [
+                        {
+                            "repository": {"full_name": "alice/app"},
+                            "path": "src/app.js",
+                            "html_url": "https://github.com/alice/app/blob/main/src/app.js",
+                            "text_matches": [{"fragment": "function targetHandler(item) {\n  return item.id;\n}"}],
+                        }
+                    ],
+                },
+            )
+
+        if request.method == "GET" and path == "/repos/alice/app/git/ref/heads/feat":
+            return httpx.Response(200, json={"object": {"sha": "head_sha_1"}})
+        if request.method == "GET" and path == "/repos/alice/app/git/commits/head_sha_1":
+            return httpx.Response(200, json={"tree": {"sha": "tree_sha_1"}})
+        if request.method == "GET" and path == "/repos/alice/app/git/trees/tree_sha_1":
+            return httpx.Response(
+                200,
+                json={
+                    "truncated": False,
+                    "tree": [
+                        {"path": "scripts/deploy.sh", "type": "blob", "mode": "100755", "size": len(script_sh)},
+                        {"path": "docs/win.txt", "type": "blob", "mode": "100644", "size": len(crlf_txt)},
+                        {"path": "src/dup.txt", "type": "blob", "mode": "100644", "size": len(dup_txt)},
+                        {"path": "src/large.js", "type": "blob", "mode": "100644", "size": len(large_60k_txt)},
+                        {"path": "src/old.js", "type": "blob", "mode": "100644", "size": 120},
+                    ],
+                },
+            )
+
+        contents_map: dict[str, tuple[bytes, str]] = {
+            "scripts/deploy.sh": (script_sh.encode("utf-8"), "sha_sh"),
+            "docs/win.txt": (crlf_txt.encode("utf-8"), "sha_win"),
+            "src/dup.txt": (dup_txt.encode("utf-8"), "sha_dup"),
+            "src/bin.dat": (bin_bytes, "sha_bin"),
+            "src/bad_utf8.bin": (bad_utf8_bytes, "sha_bad_utf8"),
+            "src/large.js": (large_60k_txt.encode("utf-8"), "sha_large"),
+            "src/shrink.js": (shrink_25k_txt.encode("utf-8"), "sha_shrink"),
+        }
+        if request.method == "GET" and path.startswith("/repos/alice/app/contents/"):
+            rel = path.removeprefix("/repos/alice/app/contents/")
+            if rel in contents_map:
+                raw_b, sha_val = contents_map[rel]
+                return httpx.Response(
+                    200,
+                    json={
+                        "path": rel,
+                        "sha": sha_val,
+                        "size": len(raw_b),
+                        "encoding": "base64",
+                        "content": base64.b64encode(raw_b).decode("ascii"),
+                        "html_url": f"https://github.com/alice/app/blob/feat/{rel}",
+                    },
+                )
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        if request.method == "PUT" and path.startswith("/repos/alice/app/contents/"):
+            put_requests.append({"path": path, "body": body})
+            rel = path.removeprefix("/repos/alice/app/contents/")
+            return httpx.Response(
+                200,
+                json={
+                    "content": {"path": rel, "html_url": f"https://github.com/alice/app/blob/feat/{rel}"},
+                    "commit": {"sha": "put_commit_1"},
+                },
+            )
+
+        if request.method == "POST" and path == "/repos/alice/app/git/blobs":
+            uploaded_blobs.append(body["content"])
+            return httpx.Response(201, json={"sha": f"blob_{len(uploaded_blobs)}"})
+        if request.method == "POST" and path == "/repos/alice/app/git/trees":
+            created_trees.append(body)
+            return httpx.Response(201, json={"sha": f"tree_{len(created_trees)}"})
+        if request.method == "POST" and path == "/repos/alice/app/git/commits":
+            commit_counter += 1
+            return httpx.Response(
+                201,
+                json={
+                    "sha": f"commit_{commit_counter}",
+                    "html_url": f"https://github.com/alice/app/commit/commit_{commit_counter}",
+                },
+            )
+        if request.method == "PATCH" and path == "/repos/alice/app/git/refs/heads/feat":
+            return httpx.Response(200, json={"object": {"sha": body["sha"]}})
+
+        if request.method == "GET" and path == "/repos/alice/app/actions/runs/9001/jobs":
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 2,
+                    "jobs": [
+                        {
+                            "id": 41,
+                            "name": "lint",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "html_url": "https://github.com/alice/app/actions/runs/9001/job/41",
+                            "steps": [{"number": 1, "name": "ruff", "status": "completed", "conclusion": "success"}],
+                        },
+                        {
+                            "id": 42,
+                            "name": "pytest",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "html_url": "https://github.com/alice/app/actions/runs/9001/job/42",
+                            "steps": [
+                                {"number": 1, "name": "run tests", "status": "completed", "conclusion": "failure"}
+                            ],
+                        },
+                    ],
+                },
+            )
+        if request.method == "GET" and path == "/repos/alice/app/actions/jobs/42/logs":
+            assert request.headers.get("Authorization") == "Bearer github_pat_test"
+            return httpx.Response(
+                302,
+                headers={"Location": "https://pipelines.actions.githubusercontent.com/logs/job_42?sig=abc"},
+            )
+
+        if request.method == "GET" and path == "/repos/alice/app/pulls/7":
+            return httpx.Response(
+                200,
+                json={
+                    "number": 7,
+                    "title": "Fix handler",
+                    "state": "open",
+                    "merged": False,
+                    "head": {"ref": "feat"},
+                    "base": {"ref": "main"},
+                    "user": {"login": "alice"},
+                    "body": "PR description",
+                    "additions": 3,
+                    "deletions": 1,
+                    "changed_files": 1,
+                    "html_url": "https://github.com/alice/app/pull/7",
+                },
+            )
+        if request.method == "GET" and path == "/repos/alice/app/pulls/7/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "filename": "src/app.js",
+                        "status": "modified",
+                        "additions": 3,
+                        "deletions": 1,
+                        "patch": "@@ -1 +1 @@",
+                    }
+                ],
+            )
+        if request.method == "GET" and path == "/repos/alice/app/pulls/7/reviews":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 101,
+                        "user": {"login": "reviewer"},
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-11-26T00:00:00Z",
+                        "body": "Please rename helper.",
+                    }
+                ],
+            )
+        if request.method == "GET" and path == "/repos/alice/app/pulls/7/comments":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 201,
+                        "user": {"login": "reviewer"},
+                        "path": "src/app.js",
+                        "line": 71,
+                        "side": "RIGHT",
+                        "in_reply_to_id": None,
+                        "diff_hunk": "@@ -70,3 +70,3 @@",
+                        "body": "Guard against null item here.",
+                        "created_at": "2026-11-26T00:01:00Z",
+                    }
+                ],
+            )
+        if request.method == "GET" and path == "/repos/alice/app/issues/7/comments":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 301,
+                        "user": {"login": "alice"},
+                        "created_at": "2026-11-26T00:02:00Z",
+                        "body": "Will address in next commit.",
+                    }
+                ],
+            )
+
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    github_personal.set_test_transport(httpx.MockTransport(gh_handler))
+    try:
+        async with Client(github_personal.mcp) as client:
+            # 1) gh_get_file_contents: find_keyword hit, jump after start_line, miss, and max_chars cap
+            kw_hit = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_get_file_contents",
+                    {"owner": "alice", "repo": "app", "path": "src/app.js", "find_keyword": "targetHandler"},
+                )
+            )
+            assert kw_hit["keyword_search"]["matched"] is True
+            assert kw_hit["keyword_search"]["first_match_line"] == 70
+            assert kw_hit["keyword_search"]["total_matching_lines"] == 2
+            assert kw_hit["start_line"] == 50
+            assert "70: function targetHandler(item)" in kw_hit["content"]
+
+            kw_jump = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_get_file_contents",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "path": "src/app.js",
+                        "start_line": 75,
+                        "find_keyword": "targetHandler",
+                    },
+                )
+            )
+            assert kw_jump["keyword_search"]["first_match_line"] == 140
+            assert "140: function targetHandlerSecond()" in kw_jump["content"]
+
+            kw_miss = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_get_file_contents",
+                    {"owner": "alice", "repo": "app", "path": "src/app.js", "find_keyword": "nonexistentToken"},
+                )
+            )
+            assert kw_miss["keyword_search"]["matched"] is False
+            assert kw_miss["content"] == ""
+
+            min_sliced = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_get_file_contents",
+                    {"owner": "alice", "repo": "app", "path": "src/min.js", "max_chars": 1000},
+                )
+            )
+            assert min_sliced["truncated"] is True
+            assert min_sliced["truncated_by_chars"] is True
+            assert "LINE TRUNCATED" in min_sliced["content"]
+
+            # 2) gh_search_code returns text-match fragments
+            search_res = _parse_tool_payload(
+                await client.call_tool("gh_search_code", {"query": "targetHandler", "repo": "alice/app"})
+            )
+            assert search_res["items"][0]["matches"] == ["function targetHandler(item) {\n  return item.id;\n}"]
+
+            # 3) gh_patch_files: dry_run makes 0 write calls
+            dry = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["scripts/deploy.sh"],
+                        "old_strings": ["PORT=8080"],
+                        "new_strings": ["PORT=9090"],
+                        "message": "dry run",
+                        "dry_run": True,
+                    },
+                )
+            )
+            assert dry["dry_run"] is True
+            assert "-PORT=8080" in dry["diff_preview"]
+            assert "+PORT=9090" in dry["diff_preview"]
+            assert len(uploaded_blobs) == 0
+
+            # 4) gh_patch_files: multi-edit single file + CRLF file in 1 atomic commit, preserving mode & CRLF
+            patched = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["scripts/deploy.sh", "scripts/deploy.sh", "docs/win.txt"],
+                        "old_strings": ["PORT=8080", "RETRY=3", "beta"],
+                        "new_strings": ["PORT=9090", "RETRY=5", "BETA_UPDATED"],
+                        "message": "patch script and crlf doc",
+                        "expected_head_sha": "head_sha_1",
+                    },
+                )
+            )
+            assert patched["dry_run"] is False
+            assert patched["commit_sha"] == "commit_1"
+            assert patched["files_updated"] == ["scripts/deploy.sh", "docs/win.txt"]
+            assert patched["files_summary"][0]["edits_applied"] == 2
+            assert patched["files_summary"][0]["mode"] == "100755"
+            assert patched["files_summary"][1]["edits_applied"] == 1
+            assert "\r\n" in uploaded_blobs[-1]
+            assert "BETA_UPDATED\r\n" in uploaded_blobs[-1]
+            assert created_trees[-1]["tree"][0]["mode"] == "100755"
+
+            # 5) gh_patch_files error guards
+            sha_mismatch = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["scripts/deploy.sh"],
+                        "old_strings": ["PORT=8080"],
+                        "new_strings": ["PORT=9090"],
+                        "message": "bad sha",
+                        "expected_head_sha": "stale_sha",
+                    },
+                )
+            )
+            assert sha_mismatch["isError"] is True
+            assert "head SHA mismatch" in sha_mismatch["error"]
+
+            zero_match = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["scripts/deploy.sh"],
+                        "old_strings": ["3: PORT=8080"],
+                        "new_strings": ["PORT=9090"],
+                        "message": "bad prefix",
+                    },
+                )
+            )
+            assert zero_match["isError"] is True
+            assert "line-number prefixes" in zero_match["error"]
+
+            ambig = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["src/dup.txt"],
+                        "old_strings": ["item()"],
+                        "new_strings": ["other()"],
+                        "message": "ambiguous",
+                    },
+                )
+            )
+            assert ambig["isError"] is True
+            assert "matched 2 locations" in ambig["error"]
+
+            for bad_path, expected_msg in (
+                ("src/bin.dat", "binary file"),
+                ("src/bad_utf8.bin", "not valid UTF-8"),
+            ):
+                err_res = _parse_tool_payload(
+                    await client.call_tool(
+                        "gh_patch_files",
+                        {
+                            "owner": "alice",
+                            "repo": "app",
+                            "branch": "feat",
+                            "file_paths": [bad_path],
+                            "old_strings": ["invalid"],
+                            "new_strings": ["fixed"],
+                            "message": "fail",
+                        },
+                    )
+                )
+                assert err_res["isError"] is True
+                assert expected_msg in err_res["error"]
+
+            owner_blocked = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_patch_files",
+                    {
+                        "owner": "bob",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["scripts/deploy.sh"],
+                        "old_strings": ["PORT=8080"],
+                        "new_strings": ["PORT=9090"],
+                        "message": "blocked",
+                    },
+                )
+            )
+            assert owner_blocked["isError"] is True
+            assert "Write blocked" in owner_blocked["error"]
+
+            # 6) Overwrite guardrails on gh_create_or_update_file & gh_push_multiple_files
+            blk_50k = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_create_or_update_file",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "path": "src/large.js",
+                        "content": large_60k_txt,
+                        "message": "overwrite large",
+                        "branch": "feat",
+                    },
+                )
+            )
+            assert blk_50k["isError"] is True
+            assert "gh_patch_files" in blk_50k["error"]
+
+            blk_shrink = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_create_or_update_file",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "path": "src/shrink.js",
+                        "content": "const x = 1;\n" * 100,
+                        "message": "shrunk",
+                        "branch": "feat",
+                    },
+                )
+            )
+            assert blk_shrink["isError"] is True
+            assert "shrinks file excessively" in blk_shrink["error"]
+            assert len(put_requests) == 0
+
+            allow_put = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_create_or_update_file",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "path": "src/large.js",
+                        "content": "replaced",
+                        "message": "force replace",
+                        "branch": "feat",
+                        "allow_large_overwrite": True,
+                    },
+                )
+            )
+            assert allow_put["commit_sha"] == "put_commit_1"
+            assert len(put_requests) == 1
+
+            blk_push = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["src/large.js"],
+                        "file_contents": ["short"],
+                        "message": "overwrite large via push",
+                    },
+                )
+            )
+            assert blk_push["isError"] is True
+            assert "gh_patch_files" in blk_push["error"]
+
+            allow_push = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["src/large.js"],
+                        "file_contents": ["short"],
+                        "message": "allow overwrite large via push",
+                        "allow_large_overwrite": True,
+                    },
+                )
+            )
+            assert allow_push["commit_sha"] == "commit_2"
+
+            # 7) gh_push_multiple_files with delete_paths (create + delete, delete-only, error cases)
+            atomic_rename = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["src/new.js"],
+                        "file_contents": ["export const ok = true;\n"],
+                        "delete_paths": ["src/old.js"],
+                        "message": "rename old.js to new.js",
+                    },
+                )
+            )
+            assert atomic_rename["files_updated"] == ["src/new.js"]
+            assert atomic_rename["files_deleted"] == ["src/old.js"]
+            assert {"path": "src/old.js", "mode": "100644", "type": "blob", "sha": None} in created_trees[-1]["tree"]
+
+            del_only = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": [],
+                        "file_contents": [],
+                        "delete_paths": ["src/old.js"],
+                        "message": "delete old.js",
+                    },
+                )
+            )
+            assert del_only["files_updated"] == []
+            assert del_only["files_deleted"] == ["src/old.js"]
+
+            del_missing = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": [],
+                        "file_contents": [],
+                        "delete_paths": ["src/missing.js"],
+                        "message": "delete missing",
+                    },
+                )
+            )
+            assert del_missing["isError"] is True
+            assert "does not exist" in del_missing["error"]
+
+            del_overlap = _parse_tool_payload(
+                await client.call_tool(
+                    "gh_push_multiple_files",
+                    {
+                        "owner": "alice",
+                        "repo": "app",
+                        "branch": "feat",
+                        "file_paths": ["src/old.js"],
+                        "file_contents": ["x"],
+                        "delete_paths": ["src/old.js"],
+                        "message": "overlap",
+                    },
+                )
+            )
+            assert del_overlap["isError"] is True
+            assert "both file_paths and delete_paths" in del_overlap["error"]
+
+            # 8) gh_get_workflow_run_jobs: 302 redirect without Auth header + tail log preservation
+            jobs_res = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "gh_get_workflow_run_jobs",
+                        "arguments": {"owner": "alice", "repo": "app", "run_id": 9001, "max_log_chars": 1200},
+                    },
+                )
+            )
+            assert jobs_res["total_jobs"] == 2
+            assert jobs_res["failed_jobs_count"] == 1
+            failed_job = jobs_res["jobs"][1]
+            assert "log_tail" in failed_job
+            assert "AssertionError in test_app.py:42" in failed_job["log_tail"]
+            assert "EXIT CODE 1" in failed_job["log_tail"]
+            assert "log_tail" not in jobs_res["jobs"][0]
+
+            # 9) gh_get_pull_request_detail: includes reviews, inline review comments, and issue comments
+            pr_res = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "gh_get_pull_request_detail",
+                        "arguments": {"owner": "alice", "repo": "app", "pr_number": 7},
+                    },
+                )
+            )
+            assert pr_res["reviews"][0]["state"] == "CHANGES_REQUESTED"
+            assert pr_res["review_comments"][0]["path"] == "src/app.js"
+            assert pr_res["review_comments"][0]["line"] == 71
+            assert pr_res["issue_comments"][0]["body"] == "Will address in next commit."
+    finally:
+        github_personal.set_test_transport(None)
+
+
+@pytest.mark.asyncio
 async def test_stateless_streamable_http_smoke() -> None:
-    for server_mod, expected_count in ((notes_web, 8), (github_personal, 12)):
+    for server_mod, expected_count in ((notes_web, 8), (github_personal, 13)):
         app = server_mod.create_http_app()
         async with app.router.lifespan_context(app):
             async with httpx.AsyncClient(

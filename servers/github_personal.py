@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import os
+import re
 from typing import Literal
 from weakref import WeakKeyDictionary
 
@@ -12,12 +14,30 @@ from fastmcp import FastMCP
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.server.transforms.search.base import serialize_tools_for_output_markdown
 
-from common.utils import IGNORED_DIRS, IGNORED_FILES, format_http_error, is_binary_bytes, slice_lines, truncate_text
+from common.utils import (
+    IGNORED_DIRS,
+    IGNORED_FILES,
+    format_http_error,
+    is_binary_bytes,
+    search_lines,
+    slice_lines,
+    truncate_tail,
+    truncate_text,
+)
 
 load_dotenv()
 
 READ_ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
 WRITE_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": True}
+
+LARGE_FILE_BLOCK_BYTES = 50_000
+LARGE_FILE_SHRINK_BYTES = 20_000
+LARGE_FILE_SHRINK_LINES = 400
+LARGE_FILE_SHRINK_RATIO = 0.6
+_TRUNCATION_SENTINEL_RE = re.compile(
+    r"(?i)(?://|#|/\*)\s*\.\.\.\s*(?:rest of|existing|unchanged|omitted|remaining|truncated)"
+)
+_LINE_PREFIX_RE = re.compile(r"(?m)^\d+:\s")
 
 PINNED_TOOLS = [
     "gh_list_repos",
@@ -25,6 +45,7 @@ PINNED_TOOLS = [
     "gh_get_file_contents",
     "gh_search_code",
     "gh_create_or_update_file",
+    "gh_patch_files",
     "gh_create_pull_request",
     "gh_create_branch",
     "gh_push_multiple_files",
@@ -56,6 +77,10 @@ def _default_file_lines() -> int:
     return int(os.getenv("DEFAULT_FILE_LINES", "350"))
 
 
+def _default_file_chars() -> int:
+    return max(2000, int(os.getenv("DEFAULT_FILE_CHARS", "32000")))
+
+
 def _default_diff_chars() -> int:
     return int(os.getenv("DEFAULT_DIFF_CHARS", "15000"))
 
@@ -64,11 +89,13 @@ def _build_server_instructions() -> str:
     owner_label = _default_owner() or "the configured account"
     return f"""
 Personal GitHub & code repository MCP server for {owner_label} (个人代码仓库 / 我的仓库 / GitHub 仓库 / 项目与主题源码管理工具):
-Directly list personal repositories (public & private), inspect repository directory trees and source code files, search code, view commits/diffs/issues/PRs/releases/Actions, download repository archives, edit files, create branches, and submit Pull Requests (支持查看我的仓库、项目文件目录、主题源码、README、分支、提交记录、Issue、PR、Actions、下载代码、修改文件与提 PR).
+Directly list personal repositories (public & private), inspect repository directory trees and source code files, search code with snippets, view commits/diffs/issues/PRs/reviews/releases/Actions & failure logs, download repository archives, patch or edit files, delete files, create branches, and submit Pull Requests (支持查看我的仓库、项目文件目录、主题源码、README、分支、提交记录、Issue、PR 与审稿意见、Actions 与失败日志、下载代码、局部补丁修改文件、删除文件与提 PR).
 
-Ask for explicit user confirmation before calling write/mutating tools (all 6 write tools are directly exposed with destructiveHint=True).
+Ask for explicit user confirmation before calling write/mutating tools (all 7 write tools are directly exposed with destructiveHint=True):
+- Use `gh_patch_files` for targeted search-and-replace edits on existing or large files (single or multi-file atomic commit).
+- Use `gh_push_multiple_files` to create, update, or delete multiple files (`delete_paths`) in a single atomic commit.
 For hidden read-only & download tools, always pass ENGLISH keywords to `search_tools`, then invoke via `call_tool`:
-- Repository inspection: repo metadata/stars/permissions (`gh_get_repo_info`), branches (`gh_list_branches`), commit history (`gh_list_commits`), commit diff (`gh_get_commit_diff`), compare refs (`gh_compare_commits`), issues (`gh_list_issues`, `gh_get_issue`), pull requests (`gh_list_pull_requests`, `gh_get_pull_request_detail`), releases (`gh_list_releases`), GitHub Actions workflows & runs (`gh_list_workflow_runs`).
+- Repository inspection: repo metadata/stars/permissions (`gh_get_repo_info`), branches (`gh_list_branches`), commit history (`gh_list_commits`), commit diff (`gh_get_commit_diff`), compare refs (`gh_compare_commits`), issues (`gh_list_issues`, `gh_get_issue`), pull requests including reviews & inline review comments (`gh_list_pull_requests`, `gh_get_pull_request_detail`), releases (`gh_list_releases`), GitHub Actions workflow runs and failed job logs (`gh_list_workflow_runs`, `gh_get_workflow_run_jobs`).
 - Code download & batch reading: generate zip/tarball download URL (`gh_get_archive_download_url`), fetch multiple files in a directory bundle (`gh_fetch_directory_bundle`).
 """.strip()
 
@@ -157,6 +184,111 @@ async def _gh_raw_bytes(path: str, params: dict | None = None) -> bytes:
     )
     resp.raise_for_status()
     return resp.content
+
+
+def _validate_repo_path(raw_path: str) -> tuple[str, str | None]:
+    clean = raw_path.strip().lstrip("/")
+    if not clean:
+        return "", "File path must not be empty."
+    if ".." in clean.split("/"):
+        return "", f"Invalid file path '{raw_path}': '..' path segments are not allowed."
+    return clean, None
+
+
+def _detect_newline_style(text: str) -> str:
+    if "\r\n" in text and "\n" not in text.replace("\r\n", ""):
+        return "\r\n"
+    if "\r\n" not in text:
+        return "\n"
+    return "mixed"
+
+
+def _check_large_overwrite_guard(
+    path: str,
+    *,
+    orig_bytes: int,
+    orig_text: str | None,
+    new_content: str,
+) -> str | None:
+    new_bytes = len(new_content.encode("utf-8"))
+    if orig_bytes >= LARGE_FILE_BLOCK_BYTES:
+        return (
+            f"Overwrite blocked for large file '{path}' ({orig_bytes:,} bytes >= {LARGE_FILE_BLOCK_BYTES:,} bytes): "
+            "use gh_patch_files for targeted edits to prevent LLM output truncation, "
+            "or pass allow_large_overwrite=True if intentionally replacing the entire file."
+        )
+    orig_lines = len(orig_text.splitlines()) if orig_text is not None else 0
+    new_lines = len(new_content.splitlines())
+    if orig_bytes >= LARGE_FILE_SHRINK_BYTES or orig_lines >= LARGE_FILE_SHRINK_LINES:
+        if new_bytes < int(orig_bytes * LARGE_FILE_SHRINK_RATIO) or (
+            orig_lines > 0 and new_lines < int(orig_lines * LARGE_FILE_SHRINK_RATIO)
+        ):
+            return (
+                f"Overwrite blocked for '{path}': replacement shrinks file excessively "
+                f"({orig_bytes:,} -> {new_bytes:,} bytes, {orig_lines} -> {new_lines} lines). "
+                "Use gh_patch_files for partial edits, or pass allow_large_overwrite=True to confirm."
+            )
+        if _TRUNCATION_SENTINEL_RE.search(new_content) and (
+            orig_text is None or not _TRUNCATION_SENTINEL_RE.search(orig_text)
+        ):
+            return (
+                f"Overwrite blocked for '{path}': truncation placeholder comment detected in replacement content. "
+                "Use gh_patch_files for partial edits, or pass allow_large_overwrite=True to confirm."
+            )
+    return None
+
+
+async def _fetch_tree_index(owner: str, repo: str, tree_sha: str) -> tuple[dict[str, dict], bool]:
+    data = await _gh_request("GET", f"/repos/{owner}/{repo}/git/trees/{tree_sha}", params={"recursive": "1"})
+    index = {e["path"]: e for e in data.get("tree", []) if e.get("type") == "blob" and e.get("path")}
+    return index, bool(data.get("truncated", False))
+
+
+async def _fetch_file_raw_at_ref(owner: str, repo: str, clean_path: str, ref: str) -> tuple[bytes | None, str | None]:
+    params = {"ref": ref} if ref else {}
+    try:
+        data = await _gh_request("GET", f"/repos/{owner}/{repo}/contents/{clean_path}", params=params)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None, f"File '{clean_path}' not found on ref '{ref}'."
+        raise
+    if isinstance(data, list):
+        return None, f"Path '{clean_path}' is a directory, not a file."
+    if (
+        data.get("encoding") == "base64"
+        and isinstance(data.get("content"), str)
+        and (data["content"] or data.get("size") == 0)
+    ):
+        return base64.b64decode(data["content"]), None
+    return await _gh_raw_bytes(f"/repos/{owner}/{repo}/contents/{clean_path}", params=params), None
+
+
+async def _gh_fetch_job_log(owner: str, repo: str, job_id: int) -> tuple[str | None, str | None]:
+    client, err = _get_gh_client()
+    if err or client is None:
+        return None, err or "GitHub client unavailable."
+    try:
+        resp = await client.get(
+            f"/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+            follow_redirects=False,
+        )
+        if resp.status_code in {301, 302, 303, 307, 308}:
+            location = resp.headers.get("Location")
+            if not location:
+                return None, f"GitHub returned HTTP {resp.status_code} without Location header for job {job_id} logs."
+            async with httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                transport=_test_transport,
+            ) as log_client:
+                log_resp = await log_client.get(location)
+                log_resp.raise_for_status()
+                return log_resp.content.decode("utf-8", errors="replace"), None
+        if resp.status_code >= 400:
+            resp.raise_for_status()
+        return resp.content.decode("utf-8", errors="replace"), None
+    except Exception as exc:
+        return None, format_http_error("GitHub", exc)
 
 
 # ==================== 置顶读工具（4 个） ====================
@@ -268,9 +400,12 @@ async def gh_get_file_contents(
     ref: str = "",
     start_line: int = 1,
     end_line: int | None = None,
+    find_keyword: str = "",
+    max_chars: int | None = None,
 ) -> dict:
-    """Read a source code file or README (or list a directory) in a personal or public code repository with line-range slicing (读取仓库源码、配置文件或 README 内容).
-    Keywords: github read file code source readme view cat content.
+    """Read a source code file or README (or list a directory) in a personal or public code repository with line-range slicing, keyword jump, and character cap (读取仓库源码、配置文件或 README 内容，支持关键字定位与字符上限保护).
+    Note: returned lines include display-only `N: ` prefixes — omit those line prefixes when calling gh_patch_files.
+    Keywords: github read file code source readme view cat content search keyword line.
     """
     try:
         clean_path = path.lstrip("/")
@@ -298,41 +433,91 @@ async def gh_get_file_contents(
                 "note": "Binary file cannot be displayed as text.",
             }
         raw_text = raw_bytes.decode("utf-8", errors="replace")
-        sliced = slice_lines(
-            raw_text,
-            start_line=start_line,
-            end_line=end_line,
-            default_max_lines=_default_file_lines(),
+        effective_max_chars = (
+            _default_file_chars() if (max_chars is None or max_chars <= 0) else max(1000, min(max_chars, 64000))
         )
-        return {
+        kw = find_keyword.strip()
+        kw_info: dict | None = None
+        if kw:
+            kw_info = search_lines(raw_text, kw, start_line=start_line)
+            if kw_info["first_match_line"] is not None:
+                slice_start = max(1, kw_info["first_match_line"] - 20)
+                slice_end = end_line if (end_line is not None and end_line >= slice_start) else None
+                sliced = slice_lines(
+                    raw_text,
+                    start_line=slice_start,
+                    end_line=slice_end,
+                    default_max_lines=_default_file_lines(),
+                    max_chars=effective_max_chars,
+                )
+            else:
+                kw_info["note"] = f"Keyword '{kw}' not found at or after line {max(1, start_line)}."
+                sliced = {
+                    "total_lines": len(raw_text.splitlines()),
+                    "start_line": max(1, start_line),
+                    "end_line": max(0, max(1, start_line) - 1),
+                    "truncated": False,
+                    "truncated_by_chars": False,
+                    "content": "",
+                }
+        else:
+            sliced = slice_lines(
+                raw_text,
+                start_line=start_line,
+                end_line=end_line,
+                default_max_lines=_default_file_lines(),
+                max_chars=effective_max_chars,
+            )
+
+        out = {
             "type": "file",
             "path": data.get("path", clean_path),
             "sha": data.get("sha", ""),
+            "size": len(raw_bytes),
             "html_url": data.get("html_url", ""),
             **sliced,
         }
+        if kw_info is not None:
+            out["keyword_search"] = kw_info
+        return out
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
 
 
 @mcp.tool(annotations={"title": "Search GitHub Code", **READ_ANNOTATIONS})
 async def gh_search_code(query: str, repo: str = "", limit: int = 15) -> dict:
-    """Search source code across personal or public GitHub repositories (在我的代码仓库或指定仓库中搜索源码、函数和关键词; pass repo as 'owner/name').
-    Keywords: github search code grep symbol function find.
+    """Search source code across personal or public GitHub repositories with matching code snippets (在我的代码仓库或指定仓库中搜索源码、函数和关键词并返回代码片段; pass repo as 'owner/name').
+    Keywords: github search code grep symbol function find snippet match.
     """
     try:
         q = f"{query} repo:{repo}" if repo else query
-        data = await _gh_request("GET", "/search/code", params={"q": q, "per_page": max(1, min(limit, 30))})
-        items = [
-            {"repo": i["repository"]["full_name"], "path": i["path"], "html_url": i["html_url"]}
-            for i in data.get("items", [])[:limit]
-        ]
+        data = await _gh_request(
+            "GET",
+            "/search/code",
+            params={"q": q, "per_page": max(1, min(limit, 30))},
+            headers={"Accept": "application/vnd.github.text-match+json"},
+        )
+        items = []
+        for i in data.get("items", [])[:limit]:
+            matches: list[str] = []
+            for tm in (i.get("text_matches") or [])[:3]:
+                frag = (tm.get("fragment") or "").strip()
+                if frag:
+                    matches.append(truncate_text(frag, max_chars=300) if len(frag) > 300 else frag)
+            items.append(
+                {
+                    "repo": i["repository"]["full_name"],
+                    "path": i["path"],
+                    "html_url": i["html_url"],
+                    "matches": matches,
+                }
+            )
         return {"query": q, "total_count": data.get("total_count", len(items)), "items": items}
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
 
 
-# ==================== 置顶写工具（全部 6 个写工具均直出，确保 destructiveHint=True 生效） ====================
+# ==================== 置顶写工具（全部 7 个写工具均直出，确保 destructiveHint=True 生效） ====================
 
 
 @mcp.tool(annotations={"title": "Create or Update File (Write)", **WRITE_ANNOTATIONS})
@@ -344,24 +529,44 @@ async def gh_create_or_update_file(
     message: str,
     branch: str,
     sha: str = "",
+    allow_large_overwrite: bool = False,
 ) -> dict:
-    """Create a new file or update an existing file in a GitHub repository branch.
+    """Create a new file or replace a small file in a GitHub repository branch.
+    For modifying existing medium/large files, use gh_patch_files instead to avoid output truncation.
     Always ask for explicit user confirmation first. Auto-fetches current sha if omitted.
     """
     if err := _check_write_allowed(owner):
         return {"isError": True, "error": err}
     clean_path = path.lstrip("/")
     try:
-        if not sha:
+        existing = None
+        if not sha or not allow_large_overwrite:
             try:
                 existing = await _gh_request(
                     "GET", f"/repos/{owner}/{repo}/contents/{clean_path}", params={"ref": branch}
                 )
-                if isinstance(existing, dict):
-                    sha = existing.get("sha", "")
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 404:
                     raise
+        if isinstance(existing, dict):
+            if not sha:
+                sha = existing.get("sha", "")
+            if not allow_large_overwrite:
+                orig_bytes = int(existing.get("size") or 0)
+                orig_text: str | None = None
+                if existing.get("encoding") == "base64" and existing.get("content"):
+                    raw_existing = base64.b64decode(existing["content"])
+                    orig_bytes = max(orig_bytes, len(raw_existing))
+                    if not is_binary_bytes(raw_existing):
+                        orig_text = raw_existing.decode("utf-8", errors="replace")
+                if guard_err := _check_large_overwrite_guard(
+                    clean_path,
+                    orig_bytes=orig_bytes,
+                    orig_text=orig_text,
+                    new_content=content,
+                ):
+                    return {"isError": True, "error": guard_err}
+
         payload: dict = {
             "message": message,
             "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
@@ -374,6 +579,216 @@ async def gh_create_or_update_file(
             "path": res["content"]["path"],
             "commit_sha": res["commit"]["sha"],
             "html_url": res["content"]["html_url"],
+        }
+    except Exception as exc:
+        return {"isError": True, "error": format_http_error("GitHub", exc)}
+
+
+@mcp.tool(annotations={"title": "Patch Existing Files in One Commit (Write)", **WRITE_ANNOTATIONS})
+async def gh_patch_files(
+    owner: str,
+    repo: str,
+    branch: str,
+    file_paths: list[str],
+    old_strings: list[str],
+    new_strings: list[str],
+    message: str,
+    expected_head_sha: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Apply targeted search-and-replace patches to one or more existing files in a single atomic commit.
+    Prefer this tool over gh_create_or_update_file whenever modifying existing medium/large files:
+    only pass short unique old_strings/new_strings snippets (without `N: ` line-number prefixes).
+    Repeating a path in file_paths applies multiple sequential patches to that file before committing.
+    Always ask for explicit user confirmation first (or pass dry_run=True to preview the diff).
+    """
+    if err := _check_write_allowed(owner):
+        return {"isError": True, "error": err}
+    if not file_paths or len(file_paths) != len(old_strings) or len(file_paths) != len(new_strings):
+        return {
+            "isError": True,
+            "error": "file_paths, old_strings, and new_strings must be non-empty lists of equal length.",
+        }
+
+    patches: list[tuple[str, str, str]] = []
+    for raw_path, old_str, new_str in zip(file_paths, old_strings, new_strings, strict=True):
+        clean_path, path_err = _validate_repo_path(raw_path)
+        if path_err:
+            return {"isError": True, "error": path_err}
+        if not old_str:
+            return {
+                "isError": True,
+                "error": (
+                    f"Empty old_strings entry for '{clean_path}': include surrounding context lines for insertions, "
+                    "or use gh_create_or_update_file / gh_push_multiple_files to create new files."
+                ),
+            }
+        if old_str == new_str:
+            return {
+                "isError": True,
+                "error": f"No-op patch for '{clean_path}': old_string and new_string are identical.",
+            }
+        patches.append((clean_path, old_str, new_str))
+
+    try:
+        ref_data = await _gh_request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{branch}")
+        parent_commit_sha = ref_data["object"]["sha"]
+        expected_sha = expected_head_sha.strip()
+        if expected_sha and parent_commit_sha != expected_sha:
+            return {
+                "isError": True,
+                "error": (
+                    f"Branch '{branch}' head SHA mismatch: expected '{expected_sha}', "
+                    f"got '{parent_commit_sha}'. Re-read the target file before patching."
+                ),
+            }
+        commit_data = await _gh_request("GET", f"/repos/{owner}/{repo}/git/commits/{parent_commit_sha}")
+        base_tree_sha = commit_data["tree"]["sha"]
+
+        tree_index: dict[str, dict] = {}
+        try:
+            tree_index, _ = await _fetch_tree_index(owner, repo, base_tree_sha)
+        except Exception:
+            tree_index = {}
+
+        unique_paths = list(dict.fromkeys(p for p, _, _ in patches))
+        file_states: dict[str, dict] = {}
+        for clean_path in unique_paths:
+            raw_bytes, fetch_err = await _fetch_file_raw_at_ref(owner, repo, clean_path, parent_commit_sha)
+            if fetch_err or raw_bytes is None:
+                return {"isError": True, "error": fetch_err or f"Unable to fetch '{clean_path}'."}
+            if is_binary_bytes(raw_bytes):
+                return {"isError": True, "error": f"Cannot patch binary file '{clean_path}'."}
+            try:
+                orig_text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                return {
+                    "isError": True,
+                    "error": f"Cannot patch '{clean_path}': file is not valid UTF-8 ({exc}).",
+                }
+            nl_style = _detect_newline_style(orig_text)
+            work_text = orig_text.replace("\r\n", "\n") if nl_style == "\r\n" else orig_text
+            file_states[clean_path] = {
+                "orig_text": orig_text,
+                "work_text": work_text,
+                "nl_style": nl_style,
+                "restore_crlf": nl_style == "\r\n",
+                "edits": 0,
+                "mode": tree_index.get(clean_path, {}).get("mode", "100644"),
+            }
+
+        for clean_path, old_str, new_str in patches:
+            st = file_states[clean_path]
+            target_old = old_str.replace("\r\n", "\n") if st["nl_style"] in {"\r\n", "\n"} else old_str
+            target_new = new_str.replace("\r\n", "\n") if st["nl_style"] in {"\r\n", "\n"} else new_str
+            buf = st["work_text"]
+            count = buf.count(target_old)
+            if count == 0:
+                err_msg = f"Patch target not found in '{clean_path}' (0 matches) on branch '{branch}'."
+                if _LINE_PREFIX_RE.search(old_str):
+                    err_msg += " Hint: remove the 'N: ' line-number prefixes copied from gh_get_file_contents."
+                if st["nl_style"] == "mixed":
+                    err_msg += " Hint: target file has mixed CRLF/LF line endings."
+                return {"isError": True, "error": err_msg}
+            if count > 1:
+                return {
+                    "isError": True,
+                    "error": (
+                        f"Ambiguous patch target in '{clean_path}': matched {count} locations. "
+                        "Include more surrounding context lines so old_string matches exactly once."
+                    ),
+                }
+            st["work_text"] = buf.replace(target_old, target_new, 1)
+            st["edits"] += 1
+
+        final_files: list[tuple[str, str, str]] = []
+        files_summary: list[dict] = []
+        diff_chunks: list[str] = []
+        for clean_path in unique_paths:
+            st = file_states[clean_path]
+            final_text = st["work_text"].replace("\n", "\r\n") if st["restore_crlf"] else st["work_text"]
+            orig_lines_lf = st["orig_text"].replace("\r\n", "\n").splitlines()
+            new_lines_lf = st["work_text"].replace("\r\n", "\n").splitlines()
+            diff_lines = list(
+                difflib.unified_diff(
+                    orig_lines_lf,
+                    new_lines_lf,
+                    fromfile=f"a/{clean_path}",
+                    tofile=f"b/{clean_path}",
+                    lineterm="",
+                )
+            )
+            additions = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+            deletions = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+            if diff_lines:
+                diff_chunks.append("\n".join(diff_lines))
+            final_files.append((clean_path, final_text, st["mode"]))
+            files_summary.append(
+                {
+                    "path": clean_path,
+                    "mode": st["mode"],
+                    "edits_applied": st["edits"],
+                    "old_lines": len(orig_lines_lf),
+                    "new_lines": len(new_lines_lf),
+                    "additions": additions,
+                    "deletions": deletions,
+                }
+            )
+
+        combined_diff = truncate_text("\n".join(diff_chunks), max_chars=_default_diff_chars())
+        if dry_run:
+            return {
+                "dry_run": True,
+                "branch": branch,
+                "base_commit_sha": parent_commit_sha,
+                "files_summary": files_summary,
+                "diff_preview": combined_diff,
+            }
+
+        tree_entries = []
+        for clean_path, final_text, mode in final_files:
+            blob = await _gh_request(
+                "POST",
+                f"/repos/{owner}/{repo}/git/blobs",
+                json={"content": final_text, "encoding": "utf-8"},
+            )
+            tree_entries.append(
+                {
+                    "path": clean_path,
+                    "mode": mode,
+                    "type": "blob",
+                    "sha": blob["sha"],
+                }
+            )
+
+        new_tree = await _gh_request(
+            "POST",
+            f"/repos/{owner}/{repo}/git/trees",
+            json={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+        new_commit = await _gh_request(
+            "POST",
+            f"/repos/{owner}/{repo}/git/commits",
+            json={
+                "message": message,
+                "tree": new_tree["sha"],
+                "parents": [parent_commit_sha],
+            },
+        )
+        await _gh_request(
+            "PATCH",
+            f"/repos/{owner}/{repo}/git/refs/heads/{branch}",
+            json={"sha": new_commit["sha"]},
+        )
+        return {
+            "dry_run": False,
+            "branch": branch,
+            "base_commit_sha": parent_commit_sha,
+            "commit_sha": new_commit["sha"],
+            "files_updated": [f["path"] for f in files_summary],
+            "files_summary": files_summary,
+            "diff_preview": combined_diff,
+            "html_url": new_commit.get("html_url", ""),
         }
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
@@ -432,27 +847,84 @@ async def gh_push_multiple_files(
     file_paths: list[str],
     file_contents: list[str],
     message: str,
+    delete_paths: list[str] | None = None,
+    allow_large_overwrite: bool = False,
 ) -> dict:
-    """Create or update multiple files in a single atomic commit using Git Data API.
+    """Create, replace, or delete multiple files in a single atomic commit using Git Data API.
+    Pass delete_paths to remove or atomically rename/split files in the same commit.
+    For partial edits to existing medium/large files, prefer gh_patch_files.
     Note: uses parallel flat lists file_paths & file_contents for strict JSON Schema compatibility.
     Always ask for explicit user confirmation first.
     """
     if err := _check_write_allowed(owner):
         return {"isError": True, "error": err}
-    if not file_paths or len(file_paths) != len(file_contents):
+    if len(file_paths) != len(file_contents):
         return {
             "isError": True,
-            "error": "file_paths and file_contents must be non-empty lists of equal length.",
+            "error": "file_paths and file_contents must be lists of equal length.",
         }
+
+    clean_updates: list[str] = []
+    for raw_path in file_paths:
+        clean_path, path_err = _validate_repo_path(raw_path)
+        if path_err:
+            return {"isError": True, "error": path_err}
+        clean_updates.append(clean_path)
+
+    if len(set(clean_updates)) != len(clean_updates):
+        return {"isError": True, "error": "Duplicate paths in file_paths are not allowed."}
+
+    clean_deletes: list[str] = []
+    for raw_del in delete_paths or []:
+        clean_del, path_err = _validate_repo_path(raw_del)
+        if path_err:
+            return {"isError": True, "error": path_err}
+        if clean_del not in clean_deletes:
+            clean_deletes.append(clean_del)
+
+    if not clean_updates and not clean_deletes:
+        return {
+            "isError": True,
+            "error": "Provide at least one file in file_paths or delete_paths.",
+        }
+
+    overlap = set(clean_updates) & set(clean_deletes)
+    if overlap:
+        return {
+            "isError": True,
+            "error": f"Paths cannot appear in both file_paths and delete_paths: {sorted(overlap)}.",
+        }
+
     try:
         ref_data = await _gh_request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{branch}")
         parent_commit_sha = ref_data["object"]["sha"]
         commit_data = await _gh_request("GET", f"/repos/{owner}/{repo}/git/commits/{parent_commit_sha}")
         base_tree_sha = commit_data["tree"]["sha"]
 
-        tree_entries = []
-        for raw_path, content in zip(file_paths, file_contents, strict=True):
-            clean_path = raw_path.lstrip("/")
+        tree_index, tree_truncated = await _fetch_tree_index(owner, repo, base_tree_sha)
+        if clean_deletes and not tree_truncated:
+            for clean_del in clean_deletes:
+                if clean_del not in tree_index:
+                    return {
+                        "isError": True,
+                        "error": f"Cannot delete '{clean_del}': file does not exist on branch '{branch}'.",
+                    }
+
+        if not allow_large_overwrite:
+            for clean_path, content in zip(clean_updates, file_contents, strict=True):
+                if clean_path in tree_index:
+                    orig_size = int(tree_index[clean_path].get("size") or 0)
+                    if orig_size >= LARGE_FILE_SHRINK_BYTES:
+                        if guard_err := _check_large_overwrite_guard(
+                            clean_path,
+                            orig_bytes=orig_size,
+                            orig_text=None,
+                            new_content=content,
+                        ):
+                            return {"isError": True, "error": guard_err}
+
+        tree_entries: list[dict] = []
+        for clean_path, content in zip(clean_updates, file_contents, strict=True):
             blob = await _gh_request(
                 "POST",
                 f"/repos/{owner}/{repo}/git/blobs",
@@ -461,9 +933,19 @@ async def gh_push_multiple_files(
             tree_entries.append(
                 {
                     "path": clean_path,
-                    "mode": "100644",
+                    "mode": tree_index.get(clean_path, {}).get("mode", "100644"),
                     "type": "blob",
                     "sha": blob["sha"],
+                }
+            )
+
+        for clean_del in clean_deletes:
+            tree_entries.append(
+                {
+                    "path": clean_del,
+                    "mode": tree_index.get(clean_del, {}).get("mode", "100644"),
+                    "type": "blob",
+                    "sha": None,
                 }
             )
 
@@ -486,12 +968,15 @@ async def gh_push_multiple_files(
             f"/repos/{owner}/{repo}/git/refs/heads/{branch}",
             json={"sha": new_commit["sha"]},
         )
-        return {
+        result: dict = {
             "branch": branch,
             "commit_sha": new_commit["sha"],
-            "files_updated": [e["path"] for e in tree_entries],
+            "files_updated": clean_updates,
             "html_url": new_commit.get("html_url", ""),
         }
+        if clean_deletes:
+            result["files_deleted"] = clean_deletes
+        return result
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
 
@@ -533,7 +1018,7 @@ async def gh_comment_issue_or_pr(owner: str, repo: str, issue_number: int, body:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
 
 
-# ==================== BM25 隐藏只读/下载工具（13 个） ====================
+# ==================== BM25 隐藏只读/下载工具（14 个） ====================
 
 
 @mcp.tool(annotations={"title": "Get Repository Info", **READ_ANNOTATIONS})
@@ -790,9 +1275,10 @@ async def gh_get_pull_request_detail(
     pr_number: int,
     include_files: bool = True,
     max_patch_chars: int | None = None,
+    include_comments: bool = True,
 ) -> dict:
-    """Get Pull Request metadata, description, and optionally changed files with truncated patches.
-    Keywords: github pull request pr detail files diff patch review.
+    """Get Pull Request metadata, description, changed files with truncated patches, and review/discussion comments.
+    Keywords: github pull request pr detail files diff patch reviews comments feedback discussion.
     """
     effective_max = max_patch_chars if max_patch_chars is not None else _default_diff_chars()
     try:
@@ -833,6 +1319,50 @@ async def gh_get_pull_request_detail(
                     }
                 )
             out["files"] = files_out
+        if include_comments:
+            reviews_raw = await _gh_request(
+                "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews", params={"per_page": 50}
+            )
+            review_comments_raw = await _gh_request(
+                "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}/comments", params={"per_page": 50}
+            )
+            issue_comments_raw = await _gh_request(
+                "GET", f"/repos/{owner}/{repo}/issues/{pr_number}/comments", params={"per_page": 50}
+            )
+            out["reviews"] = [
+                {
+                    "id": rv["id"],
+                    "author": (rv.get("user") or {}).get("login", ""),
+                    "state": rv.get("state", ""),
+                    "submitted_at": rv.get("submitted_at", ""),
+                    "body": truncate_text((rv.get("body") or "").strip(), max_chars=2000),
+                }
+                for rv in reviews_raw
+                if (rv.get("body") or "").strip() or rv.get("state") in {"CHANGES_REQUESTED", "APPROVED"}
+            ][:30]
+            out["review_comments"] = [
+                {
+                    "id": cm["id"],
+                    "author": (cm.get("user") or {}).get("login", ""),
+                    "path": cm.get("path", ""),
+                    "line": cm.get("line") if cm.get("line") is not None else cm.get("original_line"),
+                    "side": cm.get("side", ""),
+                    "in_reply_to_id": cm.get("in_reply_to_id"),
+                    "diff_hunk": truncate_text(cm.get("diff_hunk") or "", max_chars=400),
+                    "body": truncate_text(cm.get("body") or "", max_chars=2000),
+                    "created_at": cm.get("created_at", ""),
+                }
+                for cm in review_comments_raw[:30]
+            ]
+            out["issue_comments"] = [
+                {
+                    "id": cm["id"],
+                    "author": (cm.get("user") or {}).get("login", ""),
+                    "created_at": cm.get("created_at", ""),
+                    "body": truncate_text(cm.get("body") or "", max_chars=2000),
+                }
+                for cm in issue_comments_raw[:30]
+            ]
         return out
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
@@ -867,8 +1397,8 @@ async def gh_list_releases(owner: str, repo: str, limit: int = 10) -> dict:
 
 @mcp.tool(annotations={"title": "List GitHub Actions Workflow Runs", **READ_ANNOTATIONS})
 async def gh_list_workflow_runs(owner: str, repo: str, limit: int = 10) -> dict:
-    """List recent GitHub Actions workflow runs and their CI/CD status.
-    Keywords: github actions workflow runs ci cd build status logs.
+    """List recent GitHub Actions workflow runs and their CI/CD status (pass run id to gh_get_workflow_run_jobs for step status and failure logs).
+    Keywords: github actions workflow runs ci cd build status.
     """
     try:
         data = await _gh_request(
@@ -890,6 +1420,70 @@ async def gh_list_workflow_runs(owner: str, repo: str, limit: int = 10) -> dict:
             for run in data.get("workflow_runs", [])[:limit]
         ]
         return {"repo": f"{owner}/{repo}", "total_count": data.get("total_count", len(runs)), "runs": runs}
+    except Exception as exc:
+        return {"isError": True, "error": format_http_error("GitHub", exc)}
+
+
+@mcp.tool(annotations={"title": "Get Workflow Run Jobs & Failure Logs", **READ_ANNOTATIONS})
+async def gh_get_workflow_run_jobs(
+    owner: str,
+    repo: str,
+    run_id: int,
+    include_failed_logs: bool = True,
+    max_log_chars: int = 12000,
+) -> dict:
+    """Inspect jobs, step results, and trailing failure logs for a specific GitHub Actions workflow run ID.
+    Keywords: github actions workflow run jobs steps failure logs ci cd error debug traceback.
+    """
+    try:
+        data = await _gh_request(
+            "GET",
+            f"/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
+            params={"per_page": 100},
+        )
+        raw_jobs = data.get("jobs", [])
+        failed_conclusions = {"failure", "timed_out", "cancelled", "action_required"}
+        failed_jobs = [j for j in raw_jobs if (j.get("conclusion") or "").lower() in failed_conclusions]
+        clamped_budget = max(1000, min(max_log_chars, 40000))
+        per_job_budget = max(1000, clamped_budget // min(len(failed_jobs), 3)) if failed_jobs else clamped_budget
+        logs_fetched = 0
+
+        jobs_out = []
+        for j in raw_jobs:
+            conclusion = j.get("conclusion") or ""
+            steps = [
+                {
+                    "number": s.get("number", 0),
+                    "name": s.get("name") or "",
+                    "status": s.get("status") or "",
+                    "conclusion": s.get("conclusion") or "",
+                }
+                for s in (j.get("steps") or [])
+            ]
+            job_entry: dict = {
+                "id": j["id"],
+                "name": j.get("name") or "",
+                "status": j.get("status") or "",
+                "conclusion": conclusion,
+                "html_url": j.get("html_url") or "",
+                "steps": steps,
+            }
+            if include_failed_logs and conclusion.lower() in failed_conclusions and logs_fetched < 3:
+                logs_fetched += 1
+                log_text, log_err = await _gh_fetch_job_log(owner, repo, int(j["id"]))
+                if log_text is not None:
+                    job_entry["log_tail"] = truncate_tail(log_text, max_chars=per_job_budget)
+                else:
+                    job_entry["log_error"] = log_err or "Unable to fetch job logs."
+            jobs_out.append(job_entry)
+
+        return {
+            "repo": f"{owner}/{repo}",
+            "run_id": run_id,
+            "total_jobs": data.get("total_count", len(jobs_out)),
+            "failed_jobs_count": len(failed_jobs),
+            "jobs": jobs_out,
+        }
     except Exception as exc:
         return {"isError": True, "error": format_http_error("GitHub", exc)}
 
