@@ -767,63 +767,108 @@ async def web_batch_scrape(
 @mcp.tool(annotations={"title": "Extract Structured JSON (Firecrawl v2)", **READ_ONLY_ANNOTATIONS})
 async def web_extract_structured(
     urls: list[str],
-    prompt: str,
+    prompt: str = "",
     schema_json: str = "",
     wait: bool = True,
     poll_interval_sec: float = 2.0,
     timeout_sec: float = 90.0,
     confirm_large: bool = False,
 ) -> dict:
-    """Extract structured JSON data from one or more URLs (supports wildcards) using a natural language prompt and optional JSON Schema.
+    """Extract structured JSON data from one or more concrete URLs using Firecrawl v2 `/scrape` (single URL) or `/batch/scrape` (multiple URLs) JSON format with a prompt and/or JSON Schema.
     Keywords: firecrawl extract structured json schema data parse fields.
     """
-    if not urls:
+    clean_urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+    if not clean_urls:
         return {"isError": True, "error": "urls must be a non-empty list."}
+    if any("*" in u for u in clean_urls):
+        return {
+            "isError": True,
+            "error": (
+                "Wildcard URLs ('*') are not supported by Firecrawl v2 /scrape and /batch/scrape JSON extraction. "
+                "Call web_map first to resolve concrete URLs, then pass them to web_extract_structured."
+            ),
+        }
+
     soft_limit = _extract_soft_max_urls()
-    if len(urls) > soft_limit and not confirm_large:
+    if len(clean_urls) > soft_limit and not confirm_large:
         return {
             "needs_confirmation": True,
-            "requested_urls": len(urls),
+            "requested_urls": len(clean_urls),
             "soft_limit": soft_limit,
             "message": (
-                f"Structured extract targets {len(urls)} URLs, exceeding soft guardrail ({soft_limit}). "
+                f"Structured extract targets {len(clean_urls)} URLs, exceeding soft guardrail ({soft_limit}). "
                 f"Ask the user to confirm before calling again with confirm_large=True."
             ),
         }
 
-    payload: dict[str, Any] = {"urls": urls, "prompt": prompt}
-    if schema_json.strip():
+    clean_prompt = prompt.strip()
+    clean_schema = schema_json.strip()
+    if not clean_prompt and not clean_schema:
+        return {"isError": True, "error": "Provide prompt and/or schema_json for structured extraction."}
+
+    json_format: dict[str, Any] = {"type": "json"}
+    if clean_prompt:
+        json_format["prompt"] = clean_prompt
+    if clean_schema:
         try:
-            parsed_schema = json.loads(schema_json)
+            parsed_schema = json.loads(clean_schema)
         except json.JSONDecodeError as exc:
             return {"isError": True, "error": f"Invalid schema_json: {exc}"}
         if not isinstance(parsed_schema, dict):
             return {"isError": True, "error": "schema_json must decode to a JSON object."}
-        payload["schema"] = parsed_schema
+        json_format["schema"] = parsed_schema
 
-    res = await _fc_request("POST", "/extract", json=payload)
-    if res.get("isError") or not wait:
-        return res
+    if len(clean_urls) == 1:
+        res = await _fc_request("POST", "/scrape", json={"url": clean_urls[0], "formats": [json_format]})
+        if res.get("isError"):
+            return res
+        data = res.get("data") or {}
+        extracted = data.get("json") if "json" in data else data.get("extract")
+        return {
+            "success": bool(res.get("success", True)),
+            "status": "completed",
+            "url": clean_urls[0],
+            "data": extracted,
+            "metadata": data.get("metadata") or {},
+        }
 
-    job_id = res.get("id")
-    status = str(res.get("status") or "").lower()
-    if not isinstance(job_id, str) or not job_id or status == "completed" or "data" in res:
-        return res
+    start = await _fc_request("POST", "/batch/scrape", json={"urls": clean_urls, "formats": [json_format]})
+    if start.get("isError") or not wait:
+        return start
+
+    job_id = start.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return start
 
     deadline = time.monotonic() + max(1.0, timeout_sec)
     while time.monotonic() < deadline:
-        poll = await _fc_request("GET", f"/extract/{job_id}")
-        if poll.get("isError"):
-            return poll
-        poll_status = str(poll.get("status") or "").lower()
-        if poll_status in {"completed", "failed", "cancelled"} or "data" in poll:
-            return poll
+        status_res = await _fc_request("GET", f"/batch/scrape/{job_id}")
+        if status_res.get("isError"):
+            return status_res
+        status = str(status_res.get("status") or "").lower()
+        if status in {"completed", "failed", "cancelled"}:
+            items = status_res.get("data") or []
+            results = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                item_url = meta.get("sourceURL") or meta.get("url") or item.get("url") or ""
+                extracted = item.get("json") if "json" in item else item.get("extract")
+                results.append({"url": item_url, "data": extracted, "metadata": meta})
+            return {
+                "id": job_id,
+                "status": status,
+                "total": status_res.get("total", len(clean_urls)),
+                "completed": status_res.get("completed", len(results)),
+                "results": results,
+            }
         await asyncio.sleep(max(0.2, poll_interval_sec))
 
     return {
         "id": job_id,
         "status": "polling_timeout",
-        "note": "Extraction job is still running on Firecrawl.",
+        "note": f"Batch extraction job is still running on Firecrawl; check batch_id={job_id}.",
     }
 
 

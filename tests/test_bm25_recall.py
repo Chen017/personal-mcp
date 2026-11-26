@@ -209,6 +209,17 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
         payload = json.loads(request.content.decode("utf-8")) if request.content else None
         recorded_fc.append((request.method, request.url.path, payload))
         if request.method == "POST" and request.url.path == "/v2/scrape":
+            if any(isinstance(fmt, dict) and fmt.get("type") == "json" for fmt in (payload.get("formats") or [])):
+                return httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "data": {
+                            "json": {"title": "OK"},
+                            "metadata": {"sourceURL": payload.get("url", "")},
+                        },
+                    },
+                )
             if payload.get("parsers"):
                 return httpx.Response(
                     200,
@@ -254,7 +265,26 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
                 },
             )
         if request.method == "POST" and request.url.path == "/v2/batch/scrape":
+            if any(isinstance(fmt, dict) and fmt.get("type") == "json" for fmt in (payload.get("formats") or [])):
+                return httpx.Response(200, json={"success": True, "id": "batch_json_1"})
             return httpx.Response(200, json={"success": True, "id": "batch_1"})
+        if request.method == "GET" and request.url.path == "/v2/batch/scrape/batch_json_1":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "status": "completed",
+                    "total": 2,
+                    "completed": 2,
+                    "data": [
+                        {
+                            "json": {"title": f"Item {i}"},
+                            "metadata": {"sourceURL": f"https://example.com/j{i}"},
+                        }
+                        for i in range(2)
+                    ],
+                },
+            )
         if request.method == "GET" and request.url.path == "/v2/batch/scrape/batch_1":
             return httpx.Response(
                 200,
@@ -310,8 +340,6 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
                     ],
                 },
             )
-        if request.method == "POST" and request.url.path == "/v2/extract":
-            return httpx.Response(200, json={"success": True, "status": "completed", "data": {"title": "OK"}})
         return httpx.Response(404, json={"error": "not found"})
 
     notes_web.set_test_transports(
@@ -464,7 +492,7 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
             assert r_batch_ok["returned_pages"] == 2
             assert r_batch_ok["next_page_offset"] is None
 
-            # 5) web_extract_structured soft guardrail + normal run
+            # 5) web_extract_structured soft guardrail, wildcard guard, single /scrape JSON & batch /batch/scrape JSON
             r_ext_guard = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
@@ -476,16 +504,53 @@ async def test_notes_web_mock_integration(monkeypatch: pytest.MonkeyPatch) -> No
             )
             assert r_ext_guard["needs_confirmation"] is True
 
+            r_ext_wild = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_extract_structured",
+                        "arguments": {"urls": ["https://example.com/*"], "prompt": "extract"},
+                    },
+                )
+            )
+            assert r_ext_wild["isError"] is True
+            assert "Wildcard URLs" in r_ext_wild["error"]
+
             r_extract = _parse_tool_payload(
                 await client.call_tool(
                     "call_tool",
                     {
                         "name": "web_extract_structured",
-                        "arguments": {"urls": ["https://example.com"], "prompt": "extract title"},
+                        "arguments": {
+                            "urls": ["https://example.com"],
+                            "prompt": "extract title",
+                            "schema_json": '{"type":"object","properties":{"title":{"type":"string"}}}',
+                        },
                     },
                 )
             )
+            assert r_extract["status"] == "completed"
             assert r_extract["data"]["title"] == "OK"
+            last_scrape_json = [body for m, p, body in recorded_fc if (m, p) == ("POST", "/v2/scrape")][-1]
+            assert last_scrape_json["formats"][0]["type"] == "json"
+            assert last_scrape_json["formats"][0]["schema"]["properties"]["title"]["type"] == "string"
+
+            r_extract_batch = _parse_tool_payload(
+                await client.call_tool(
+                    "call_tool",
+                    {
+                        "name": "web_extract_structured",
+                        "arguments": {
+                            "urls": ["https://example.com/j0", "https://example.com/j1"],
+                            "prompt": "extract title",
+                        },
+                    },
+                )
+            )
+            assert r_extract_batch["status"] == "completed"
+            assert len(r_extract_batch["results"]) == 2
+            assert r_extract_batch["results"][0]["data"]["title"] == "Item 0"
+            assert sum(1 for _, p, _ in recorded_fc if p.startswith("/v2/extract")) == 0
 
             # 6) Interact session + credit check
             r_start = _parse_tool_payload(
